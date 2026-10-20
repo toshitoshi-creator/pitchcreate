@@ -1,0 +1,40 @@
+name: iOS
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    name: iOS (device, unsigned)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch submodules
+        # ARA is plug-in only and not needed for the iOS app.
+        run: git submodule update --init --depth 1 third_party/JUCE third_party/r8brain-free-src
+
+      - name: Configure
+        run: |
+          cmake -B build-ios -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64
+
+      - name: Build
+        run: |
+          cmake --build build-ios --config Release --target PitchNet -- \
+            -sdk iphoneos -quiet CODE_SIGNING_ALLOWED=NO
+
+      - name: Check bundle contents
+        run: |
+          APP=$(find build-ios -name "PitchNet.app" -type d -path "*Release-iphoneos*" | head -1)
+          echo "App: $APP"
+          ls -la "$APP" "$APP/Resources" "$APP/Resources/models" "$APP/Resources/models/GAME"
+          test -f "$APP/Resources/models/fcpe.onnx"
+          test -f "$APP/Resources/models/pc_nsf_hifigan.onnx"
+          test -f "$APP/Resources/models/GAME/encoder.onnx"
+          du -sh "$APP"

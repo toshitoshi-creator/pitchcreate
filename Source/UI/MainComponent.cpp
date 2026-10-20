@@ -694,7 +694,10 @@ MainComponent::MainComponent(bool enableAudioDevice)
   };
 
   // Add child components - standalone uses menus; plugin instances do not.
-#if JUCE_MAC
+#if PITCHNET_MOBILE_UI
+  if (!isPluginMode())
+    setupMobileUi();
+#elif JUCE_MAC
 #else
   if (!isPluginMode() && menuHandler)
   {
@@ -1393,6 +1396,12 @@ MainComponent::~MainComponent()
   setComponentEffect(nullptr);
   noteDragAuditionActive = false;
   resampledLoopAudition.reset();
+#if PITCHNET_MOBILE_UI
+  // The recorder is a callback on the engine's device manager.
+  if (micRecorder)
+    micRecorder->stop();
+  micRecorder.reset();
+#endif
 #if JUCE_MAC
   if (!isPluginMode() && menuHandler)
     juce::MenuBarModel::setMacMainMenu(nullptr);
@@ -1466,7 +1475,15 @@ void MainComponent::resized()
   }
   auto bounds = getLocalBounds();
 
-#if !JUCE_MAC
+#if PITCHNET_MOBILE_UI
+  // Keep controls out from under the notch and home indicator. The window is
+  // full screen, so the display insets apply directly.
+  if (auto *display = juce::Desktop::getInstance().getDisplays().getDisplayForRect(
+          getScreenBounds()))
+    bounds = display->safeAreaInsets.subtractedFrom(bounds);
+  if (!isPluginMode())
+    mobileBar.setBounds(bounds.removeFromTop(MobileBar::kHeight));
+#elif !JUCE_MAC
   // Menu bar at top for non-mac platforms
   if (!isPluginMode() && menuHandler)
     menuBar.setBounds(bounds.removeFromTop(24));
@@ -1506,6 +1523,9 @@ void MainComponent::mouseDoubleClick(const juce::MouseEvent &e)
 void MainComponent::timerCallback()
 {
   dispatchPendingDragAudition();
+#if PITCHNET_MOBILE_UI
+  updateMobileBar();
+#endif
 
   // Handle throttled cursor updates (30Hz max)
   if (hasPendingCursorUpdate.load())
@@ -1659,7 +1679,21 @@ void MainComponent::saveProject(bool saveAs)
           juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
               .getChildFile("Untitled.pitchnet");
 
-#if JUCE_WINDOWS && JUCE_MODAL_LOOPS_PERMITTED
+#if PITCHNET_MOBILE_UI
+    // No save picker on mobile: projects live next to their audio in the
+    // app's Documents folder, which the Files app can browse.
+    if (!audio.existsAsFile())
+      target = getMobileFolder("Projects").getChildFile("Untitled.pitchnet");
+    toolbar.showProgress(TR("progress.saving"));
+    toolbar.setProgress(-1.0f);
+
+    ensureAudioSha();
+    if (ProjectSerializer::saveToFile(*project, target))
+      project->setProjectFilePath(target);
+
+    toolbar.hideProgress();
+    return;
+#elif JUCE_WINDOWS && JUCE_MODAL_LOOPS_PERMITTED
     juce::FileChooser chooser(TR("dialog.save_project"), target, "*.pitchnet",
                               true, false, this);
     if (!chooser.browseForFileToSave(true))
@@ -1768,6 +1802,13 @@ void MainComponent::openFile()
         if (safeThis == nullptr)
           return;
 
+#if PITCHNET_MOBILE_UI
+        const auto url = fc.getURLResult();
+        safeThis->fileChooser.reset(); // Allow next dialog to open
+        if (!url.isEmpty())
+          safeThis->importAndOpen(url);
+        return;
+#endif
         auto file = fc.getResult();
         safeThis->fileChooser.reset(); // Allow next dialog to open
         if (file.existsAsFile()) {
@@ -2059,7 +2100,7 @@ void MainComponent::exportFile()
               }
             } while (false);
 
-            juce::MessageManager::callAsync([safeThis, success, error]() {
+            juce::MessageManager::callAsync([safeThis, success, error, file]() {
               if (safeThis == nullptr)
                 return;
               safeThis->toolbar.setEnabled(true);
@@ -2069,12 +2110,33 @@ void MainComponent::exportFile()
                     safeThis.getComponent(), TR("dialog.export_failed"), error,
                     StyledMessageBox::WarningIcon);
               }
+#if PITCHNET_MOBILE_UI
+              else {
+                safeThis->shareExportedFile(file);
+              }
+#endif
             }); })
               .detach();
         };
 
         if (safeThis->fileChooser != nullptr)
           return;
+
+#if PITCHNET_MOBILE_UI
+        // Render into the app's Exports folder, then hand the file to the
+        // share sheet (Save to Files, AirDrop, Messages, ...).
+        if (auto *activeProject = safeThis->getProject())
+        {
+          auto name = activeProject->getFilePath().getFileNameWithoutExtension();
+          if (name.isEmpty())
+            name = "PitchNet";
+          performExport(getMobileFolder("Exports")
+                            .getChildFile(name + "_tuned")
+                            .withFileExtension(ExportHelper::getFormatExtension(
+                                exportSettings->format)));
+        }
+        return;
+#endif
 
         juce::File defaultFile;
         if (!safeThis->isPluginMode())
@@ -2155,7 +2217,13 @@ void MainComponent::exportMidiFile()
     defaultFile = project->getProjectFilePath().withFileExtension("mid");
   }
 
-#if JUCE_WINDOWS && JUCE_MODAL_LOOPS_PERMITTED
+#if PITCHNET_MOBILE_UI || (JUCE_WINDOWS && JUCE_MODAL_LOOPS_PERMITTED)
+#if PITCHNET_MOBILE_UI
+  auto file = getMobileFolder("Exports").getChildFile(
+      (defaultFile != juce::File{} ? defaultFile.getFileNameWithoutExtension()
+                                   : juce::String("PitchNet")) +
+      ".mid");
+#else
   juce::FileChooser chooser(TR("dialog.export_midi"), defaultFile,
                             "*.mid;*.midi", true, false, this);
   if (!chooser.browseForFileToSave(true))
@@ -2164,6 +2232,7 @@ void MainComponent::exportMidiFile()
   auto file = chooser.getResult();
   if (file == juce::File{})
     return;
+#endif
 
   // Ensure .mid extension
   if (file.getFileExtension().isEmpty())
@@ -2195,6 +2264,12 @@ void MainComponent::exportMidiFile()
         TR("dialog.failed_write_midi") + "\n" + file.getFullPathName(),
         StyledMessageBox::WarningIcon);
   }
+#if PITCHNET_MOBILE_UI
+  else
+  {
+    shareExportedFile(file);
+  }
+#endif
 #else
   fileChooser = std::make_unique<juce::FileChooser>(
       TR("dialog.export_midi"), defaultFile, "*.mid;*.midi");

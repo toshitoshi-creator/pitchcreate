@@ -271,5 +271,15 @@
   "update.download_now": "今すぐダウンロード",
   "update.message": "PitchNet の新しいバージョンがあります。ダウンロードしますか？",
   "update.skip_version": "このバージョンをスキップ",
-  "update.title": "アップデートがあります"
+  "update.title": "アップデートがあります",
+  "mobile.record": "録音",
+  "mobile.stop_recording": "停止",
+  "mobile.recording": "録音中",
+  "mobile.open": "開く",
+  "mobile.save": "保存",
+  "mobile.share": "書き出し",
+  "mobile.menu": "メニュー",
+  "mobile.mic_denied": "マイクへのアクセスが許可されていません。設定 > プライバシー > マイク で許可してください。",
+  "mobile.record_failed": "録音に失敗しました",
+  "mobile.import_failed": "選択したファイルを読み込めませんでした。"
 }

@@ -1869,6 +1869,9 @@ void PianoRollComponent::finishTrackGesture()
 
 void PianoRollComponent::mouseDown(const juce::MouseEvent &e)
 {
+  if (handleTouchGesture(e, TouchPhase::down))
+    return;
+
   swallowGestureUntilMouseUp = false;
 
   if (!project)
@@ -2091,6 +2094,8 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent &e)
 
 void PianoRollComponent::mouseDrag(const juce::MouseEvent &e)
 {
+  if (handleTouchGesture(e, TouchPhase::drag))
+    return;
   if (trackGestureActive) { updateTrackGesture(e); return; }
   if (e.mods.isPopupMenu())
     return;
@@ -2151,6 +2156,8 @@ void PianoRollComponent::mouseDrag(const juce::MouseEvent &e)
 
 void PianoRollComponent::mouseUp(const juce::MouseEvent &e)
 {
+  if (handleTouchGesture(e, TouchPhase::up))
+    return;
   if (trackGestureActive) { finishTrackGesture(); return; }
   if (e.mods.isPopupMenu())
     return;
@@ -2649,6 +2656,11 @@ void PianoRollComponent::mouseMagnify(const juce::MouseEvent &e,
                                       float scaleFactor)
 {
   // Pinch-to-zoom on trackpad - horizontal zoom, center on mouse position
+  zoomHorizontallyAround(static_cast<float>(e.x - pianoKeysWidth), scaleFactor);
+}
+
+void PianoRollComponent::zoomHorizontallyAround(float mouseX, float scaleFactor)
+{
   const int visibleWidth = getVisibleContentWidth();
   const double totalTime = getTimelineLength();
   const float minPpsX =
@@ -2656,7 +2668,6 @@ void PianoRollComponent::mouseMagnify(const juce::MouseEvent &e,
           ? std::max(MIN_PIXELS_PER_SECOND,
                      static_cast<float>(visibleWidth / totalTime))
           : MIN_PIXELS_PER_SECOND;
-  float mouseX = static_cast<float>(e.x - pianoKeysWidth);
   double timeAtMouse = xToTime(mouseX + static_cast<float>(scrollX));
 
   float newPps = pixelsPerSecond * scaleFactor;
@@ -2675,6 +2686,119 @@ void PianoRollComponent::mouseMagnify(const juce::MouseEvent &e,
 
   if (onZoomChanged)
     onZoomChanged(pixelsPerSecond);
+}
+
+bool PianoRollComponent::handleTouchGesture(const juce::MouseEvent &e,
+                                            TouchPhase phase)
+{
+  if (!e.source.isTouch() || finishingSingleTouch)
+    return false;
+
+  const int index = e.source.getIndex();
+  const auto position = e.getEventRelativeTo(this).position;
+
+  switch (phase)
+  {
+  case TouchPhase::down:
+    activeTouches[index] = position;
+    if (touchGestureActive)
+      return true;
+
+    if (activeTouches.size() >= 2)
+    {
+      // A second finger turns the touch into navigation. Finish whatever the
+      // first finger started (it has barely moved) so no edit is left open.
+      if (lastSingleTouchEvent != nullptr)
+      {
+        const juce::ScopedValueSetter<bool> finishing(finishingSingleTouch, true);
+        mouseUp(*lastSingleTouchEvent);
+      }
+      lastSingleTouchEvent.reset();
+
+      touchGestureActive = true;
+      const auto first = activeTouches.begin()->second;
+      const auto second = std::next(activeTouches.begin())->second;
+      lastTouchCentroid = (first + second) * 0.5f;
+      lastTouchSpan = {std::abs(first.x - second.x), std::abs(first.y - second.y)};
+      return true;
+    }
+
+    lastSingleTouchEvent = std::make_unique<juce::MouseEvent>(e);
+    return false;
+
+  case TouchPhase::drag:
+    if (activeTouches.count(index) != 0)
+      activeTouches[index] = position;
+    if (!touchGestureActive)
+    {
+      lastSingleTouchEvent = std::make_unique<juce::MouseEvent>(e);
+      return false;
+    }
+    applyTouchGesture();
+    return true;
+
+  case TouchPhase::up:
+    activeTouches.erase(index);
+    if (touchGestureActive)
+    {
+      // Stay in navigation until every finger has lifted, so the remaining
+      // finger does not start an edit.
+      if (activeTouches.empty())
+        touchGestureActive = false;
+      return true;
+    }
+    lastSingleTouchEvent.reset();
+    return false;
+  }
+
+  return false;
+}
+
+void PianoRollComponent::applyTouchGesture()
+{
+  if (activeTouches.size() < 2)
+    return;
+
+  const auto first = activeTouches.begin()->second;
+  const auto second = std::next(activeTouches.begin())->second;
+  const auto centroid = (first + second) * 0.5f;
+  const juce::Point<float> span{std::abs(first.x - second.x),
+                                std::abs(first.y - second.y)};
+
+  // Zoom each axis by how far the fingers spread along it. Below a minimum
+  // spread the ratio is too noisy, which also keeps a mostly horizontal pinch
+  // from zooming vertically and vice versa.
+  constexpr float minSpan = 40.0f;
+  if (span.x > minSpan && lastTouchSpan.x > minSpan)
+  {
+    const float factor = span.x / lastTouchSpan.x;
+    if (std::abs(factor - 1.0f) > 0.001f)
+    {
+      zoomHorizontallyAround(centroid.x - static_cast<float>(pianoKeysWidth), factor);
+    }
+  }
+  if (span.y > minSpan && lastTouchSpan.y > minSpan)
+  {
+    const float factor = span.y / lastTouchSpan.y;
+    if (std::abs(factor - 1.0f) > 0.001f)
+    {
+      setPixelsPerSemitone(pixelsPerSemitone * factor,
+                           centroid.y - static_cast<float>(headerHeight));
+    }
+  }
+
+  const auto delta = centroid - lastTouchCentroid;
+  const double previousScrollX = scrollX;
+  setScrollX(scrollX - static_cast<double>(delta.x));
+  setScrollY(scrollY - static_cast<double>(delta.y));
+
+  lastTouchCentroid = centroid;
+  lastTouchSpan = span;
+
+  updateScrollBars();
+  repaint();
+  if (std::abs(scrollX - previousScrollX) >= 0.01 && onScrollChanged)
+    onScrollChanged(scrollX);
 }
 
 void PianoRollComponent::scrollBarMoved(juce::ScrollBar *scrollBar,

@@ -13,6 +13,8 @@
 #include "Components/AppFont.h"
 #include "Main/MenuHandler.h"
 #include "Main/SettingsManager.h"
+#include "Mobile/MobileBar.h"
+#include "../Audio/IO/MicRecorder.h"
 #include "ParameterPanel.h"
 #include "TrackListPanel.h"
 #include "PianoRollComponent.h"
@@ -384,6 +386,24 @@ private:
 
   CustomMenuBarLookAndFeel menuBarLookAndFeel;
   juce::MenuBarComponent menuBar;
+#if PITCHNET_MOBILE_UI
+  // Mobile: action bar in place of the menu bar, mic recording, and exports
+  // handed to the share sheet. See MainComponent_Mobile.cpp.
+  MobileBar mobileBar;
+  std::unique_ptr<MicRecorder> micRecorder;
+  juce::ScopedMessageBox shareSession;
+  void setupMobileUi();
+  void toggleMobileRecording();
+  void startMobileRecording();
+  void finishMobileRecording();
+  void showMobileMenu();
+  void updateMobileBar();
+  // Copies a picked document into the app sandbox and opens it there, so it
+  // stays readable after the document picker's access grant ends.
+  void importAndOpen(const juce::URL &url);
+  void shareExportedFile(const juce::File &file);
+  static juce::File getMobileFolder(const juce::String &name);
+#endif
 #if JUCE_MAC
   juce::PopupMenu macExtraAppleMenuItems;
 #endif

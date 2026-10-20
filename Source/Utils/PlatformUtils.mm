@@ -5,8 +5,12 @@
 // here and the whole macOS implementation used to compile out to the no-op
 // stubs below - leaving the standalone window with stock light title bar
 // chrome. This file is Objective-C++ and is only ever compiled on Apple
-// platforms, so __APPLE__ is the correct guard.
+// platforms, so __APPLE__ is the correct guard. TARGET_OS_OSX keeps the
+// AppKit code out of the iOS build, which takes the no-op stubs instead.
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && TARGET_OS_OSX
 #import <Cocoa/Cocoa.h>
 
 namespace PlatformUtils

@@ -5,6 +5,10 @@
 
 ![PitchNet editor screenshot](docs/images/pitchnet-editor.png)
 
+> **iPhone port.** This repository adds an iOS build of the standalone app with a
+> touch layout (record, open, share exports, pinch zoom). See
+> [docs/ios.md](docs/ios.md) for build and install steps.
+
 ## Origin, attribution, and license
 
 PitchNet is a modified derivative of [HachiTune](https://github.com/KCKT0112/HachiTune), an open-source project developed by the HachiTune contributors. It includes substantial code derived from HachiTune, along with subsequent changes by Session Loops and other contributors. This repository does not claim sole authorship of the derived work.

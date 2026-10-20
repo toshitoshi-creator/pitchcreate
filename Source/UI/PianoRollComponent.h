@@ -24,6 +24,7 @@
 #include "Buttons.h"
 #include "RegionPreview.h"
 
+#include <map>
 #include <memory>
 #include <optional>
 
@@ -525,6 +526,22 @@ private:
   // Set when a click only activated another region (its project was not
   // ready yet), so the rest of that gesture must not edit anything.
   bool swallowGestureUntilMouseUp = false;
+
+  // Horizontal zoom keeping the time under contentX (relative to the grid's
+  // left edge) in place. Shared by trackpad magnify and touch pinch.
+  void zoomHorizontallyAround(float contentX, float scaleFactor);
+
+  // Two-finger touch: pinch to zoom (horizontal and vertical spread zoom
+  // their own axis) and drag to scroll. One finger keeps the normal tools.
+  enum class TouchPhase { down, drag, up };
+  bool handleTouchGesture(const juce::MouseEvent &e, TouchPhase phase);
+  void applyTouchGesture();
+  std::map<int, juce::Point<float>> activeTouches;
+  std::unique_ptr<juce::MouseEvent> lastSingleTouchEvent;
+  bool touchGestureActive = false;
+  bool finishingSingleTouch = false;
+  juce::Point<float> lastTouchCentroid;
+  juce::Point<float> lastTouchSpan;
 
   // Re-applies the hover-button tooltips after a language change; the menus
   // and handle labels are built on demand, so they need nothing here.

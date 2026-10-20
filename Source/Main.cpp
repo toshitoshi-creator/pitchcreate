@@ -161,7 +161,7 @@ public:
     LOG("Loading localization...");
     Localization::loadFromSettings();
     LOG("Localization loaded, showing splash...");
-#if JUCE_STANDALONE_APPLICATION
+#if JUCE_STANDALONE_APPLICATION && !JUCE_IOS
     splashWindow = std::make_unique<SplashWindow>();
 #endif
 
@@ -194,7 +194,14 @@ public:
   void systemRequestedQuit() override { quit(); }
 
   void anotherInstanceStarted(const juce::String &commandLine) override {
+#if JUCE_IOS
+    // iOS reports "Open in PitchNet" from other apps as a file URL.
+    const juce::URL url(commandLine.unquoted());
+    if (url.isLocalFile() && mainWindow != nullptr)
+      mainWindow->openFile(url.getLocalFile());
+#else
     juce::ignoreUnused(commandLine);
+#endif
   }
 
   class MainWindow : public juce::DocumentWindow {
@@ -221,6 +228,15 @@ public:
 
       // Now set native title bar after content is set
       setUsingNativeTitleBar(true);
+
+#if PITCHNET_MOBILE_UI
+      // A phone app owns the whole screen; MainComponent keeps its controls
+      // inside the safe area.
+      setFullScreen(true);
+      addToDesktop();
+      setVisible(true);
+      return;
+#endif
 
       setResizable(true, true);
 

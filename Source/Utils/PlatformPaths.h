@@ -24,7 +24,12 @@ namespace PlatformPaths
 {
     inline juce::File getProjectResourcesDirectory()
     {
-#if JUCE_DEBUG
+#if JUCE_IOS
+        // The build copies models and fonts to <app>/Resources (iOS bundles
+        // are flat, so there is no Contents/ folder).
+        return juce::File::getSpecialLocation(juce::File::currentApplicationFile)
+            .getChildFile("Resources");
+#elif JUCE_DEBUG
 #ifdef PITCHNET_PROJECT_RESOURCES_DIR
         auto configuredResources = juce::File(juce::String(PITCHNET_PROJECT_RESOURCES_DIR));
         if (configuredResources.isDirectory())
@@ -62,7 +67,9 @@ namespace PlatformPaths
 
     inline juce::File getDefaultLocalResourcesModelsDirectory()
     {
-#if JUCE_MAC
+#if JUCE_IOS
+        return getProjectResourcesDirectory().getChildFile("models");
+#elif JUCE_MAC
         return getApplicationFile().getChildFile("Contents/Resources/models");
 #else
         auto dir = getApplicationFile().getParentDirectory();

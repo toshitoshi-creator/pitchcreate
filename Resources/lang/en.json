@@ -273,5 +273,15 @@
   "update.download_now": "Download Now",
   "update.message": "A new version of PitchNet is available. Would you like to download it?",
   "update.skip_version": "Skip This Version",
-  "update.title": "Update Available"
+  "update.title": "Update Available",
+  "mobile.record": "Record",
+  "mobile.stop_recording": "Stop",
+  "mobile.recording": "Recording",
+  "mobile.open": "Open",
+  "mobile.save": "Save",
+  "mobile.share": "Export",
+  "mobile.menu": "Menu",
+  "mobile.mic_denied": "Microphone access was denied. Allow it in Settings > Privacy > Microphone.",
+  "mobile.record_failed": "Recording failed",
+  "mobile.import_failed": "Could not import the selected file."
 }

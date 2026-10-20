@@ -1,9 +1,21 @@
 cmake_minimum_required(VERSION 3.22)
-set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "Minimum macOS deployment target" FORCE)
+
+# iOS builds are configured with -G Xcode -DCMAKE_SYSTEM_NAME=iOS (see
+# docs/ios.md). CMake only defines IOS after project(), so test the system
+# name directly here.
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(PITCHNET_IOS ON)
+    # Linking an .xcframework (the iOS ONNX Runtime package) needs 3.28.
+    cmake_minimum_required(VERSION 3.28)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "16.0" CACHE STRING "Minimum iOS deployment target" FORCE)
+else()
+    set(PITCHNET_IOS OFF)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "Minimum macOS deployment target" FORCE)
+endif()
 
 # Ship universal macOS binaries by default. A caller can still request a
 # single-architecture build with -DCMAKE_OSX_ARCHITECTURES=arm64 or x86_64.
-if(CMAKE_HOST_APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
+if(CMAKE_HOST_APPLE AND NOT PITCHNET_IOS AND NOT CMAKE_OSX_ARCHITECTURES)
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING
         "macOS target architectures" FORCE)
 endif()
@@ -55,7 +67,7 @@ set(ONNXRUNTIME_VERSION "1.19.2" CACHE STRING "ONNX Runtime version" FORCE)
 set(GAME_MODELS_VERSION "v1.0.3" CACHE STRING "GAME release tag used to download model assets")
 set(GAME_MODELS_URL "" CACHE STRING "Optional URL to download GAME model zip")
 
-if(APPLE)
+if(APPLE AND NOT PITCHNET_IOS)
     list(FIND CMAKE_OSX_ARCHITECTURES "arm64" PITCHNET_ARM64_ARCH_INDEX)
     list(FIND CMAKE_OSX_ARCHITECTURES "x86_64" PITCHNET_X86_64_ARCH_INDEX)
 
@@ -113,7 +125,12 @@ if(PITCHNET_ASIO_ENABLED)
 endif()
 
 # Check if ONNX Runtime already exists in build directory
-if(APPLE)
+if(PITCHNET_IOS)
+    # iOS has no dylib package; Microsoft ships a static xcframework as the
+    # CocoaPods/SwiftPM "pod archive" instead.
+    set(ONNXRUNTIME_CACHE_DIR
+        "${CMAKE_BINARY_DIR}/_deps/onnxruntime-${ONNXRUNTIME_VERSION}-ios-src")
+elseif(APPLE)
     # Keep packages for different architecture selections separate so that
     # reconfiguring an existing build cannot accidentally reuse an ARM-only
     # runtime in an Intel or universal build.
@@ -125,6 +142,8 @@ else()
 endif()
 if(WIN32 AND USE_DIRECTML)
     set(ONNXRUNTIME_CACHE_HEADER "${ONNXRUNTIME_CACHE_DIR}/build/native/include/onnxruntime_cxx_api.h")
+elseif(PITCHNET_IOS)
+    set(ONNXRUNTIME_CACHE_HEADER "${ONNXRUNTIME_CACHE_DIR}/onnxruntime.xcframework/Info.plist")
 else()
     set(ONNXRUNTIME_CACHE_HEADER "${ONNXRUNTIME_CACHE_DIR}/include/onnxruntime_cxx_api.h")
 endif()
@@ -133,7 +152,9 @@ if(EXISTS "${ONNXRUNTIME_CACHE_HEADER}")
     set(ONNXRUNTIME_ROOT ${ONNXRUNTIME_CACHE_DIR})
 else()
     # Detect platform and set download URL
-    if(WIN32)
+    if(PITCHNET_IOS)
+        set(ONNXRUNTIME_URL "https://download.onnxruntime.ai/pod-archive-onnxruntime-c-${ONNXRUNTIME_VERSION}.zip")
+    elseif(WIN32)
         if(USE_CUDA)
             set(ONNXRUNTIME_URL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-win-x64-gpu_cuda13-${ONNXRUNTIME_VERSION}.zip")
             message(STATUS "Downloading ONNX Runtime GPU CUDA13 package (Windows)")
@@ -177,6 +198,17 @@ if(WIN32 AND USE_DIRECTML)
     set(ONNXRUNTIME_INCLUDE_DIR ${ONNXRUNTIME_ROOT}/build/native/include)
     set(ONNXRUNTIME_LIBRARY ${ONNXRUNTIME_ROOT}/runtimes/win-x64/native/onnxruntime.lib)
     set(ONNXRUNTIME_DLL_DIR ${ONNXRUNTIME_ROOT}/runtimes/win-x64/native)
+elseif(PITCHNET_IOS)
+    set(ONNXRUNTIME_INCLUDE_DIR ${ONNXRUNTIME_ROOT}/Headers)
+    if(NOT EXISTS ${ONNXRUNTIME_INCLUDE_DIR}/onnxruntime_cxx_api.h)
+        # Older archives only carry the headers inside each framework slice.
+        set(ONNXRUNTIME_INCLUDE_DIR
+            ${ONNXRUNTIME_ROOT}/onnxruntime.xcframework/ios-arm64/onnxruntime.framework/Headers)
+    endif()
+    set(ONNXRUNTIME_LIBRARY ${ONNXRUNTIME_ROOT}/onnxruntime.xcframework)
+    if(NOT EXISTS ${ONNXRUNTIME_LIBRARY})
+        unset(ONNXRUNTIME_LIBRARY)
+    endif()
 else()
     set(ONNXRUNTIME_INCLUDE_DIR ${ONNXRUNTIME_ROOT}/include)
     if(WIN32)
@@ -262,8 +294,30 @@ juce_add_gui_app(PitchNet
     ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/Resources/images/icon.png"
     ICON_SMALL "${CMAKE_CURRENT_SOURCE_DIR}/Resources/images/icon.png"
     MICROPHONE_PERMISSION_ENABLED TRUE
+    MICROPHONE_PERMISSION_TEXT "PitchNet records your voice so you can edit its pitch."
     FILE_SHARING_ENABLED TRUE
-    DOCUMENT_EXTENSIONS "wav;mp3;flac;ogg")
+    DOCUMENT_BROWSER_ENABLED TRUE
+    STATUS_BAR_HIDDEN TRUE
+    REQUIRES_FULL_SCREEN TRUE
+    TARGETED_DEVICE_FAMILY "1,2"
+    IPHONE_SCREEN_ORIENTATIONS UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
+    IPAD_SCREEN_ORIENTATIONS UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
+    DOCUMENT_EXTENSIONS "wav;mp3;flac;ogg;m4a;aac;caf;aif;aiff")
+
+if(PITCHNET_IOS)
+    # Signing team for device builds. Leave empty to pick it in Xcode.
+    set(PITCHNET_IOS_DEVELOPMENT_TEAM "" CACHE STRING "Apple development team ID for iOS signing")
+    if(PITCHNET_IOS_DEVELOPMENT_TEAM)
+        set_target_properties(PitchNet PROPERTIES
+            XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${PITCHNET_IOS_DEVELOPMENT_TEAM}")
+    endif()
+    set_target_properties(PitchNet PROPERTIES
+        XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic")
+endif()
+
+# The plug-in formats (VST3/AU/AAX/ARA) are desktop only; iOS builds just the
+# standalone app.
+if(NOT PITCHNET_IOS)
 
 # AAX SDK configuration (bundled in third_party/, with env/cache override support)
 set(PITCHNET_BUNDLED_AAX_SDK_PATH "${CMAKE_CURRENT_SOURCE_DIR}/third_party/AAX_SDK")
@@ -365,6 +419,8 @@ if(AAX_AVAILABLE)
         ${AAX_SDK_PATH}/Interfaces/ACF)
 endif()
 
+endif() # NOT PITCHNET_IOS
+
 # Add source files using GLOB_RECURSE
 file(GLOB_RECURSE PITCHNET_CORE_SOURCES
     "Source/Audio/*.cpp" "Source/Audio/*.h"
@@ -410,9 +466,11 @@ target_sources(PitchNet PRIVATE
     Source/Main.cpp
     )
 
-target_sources(PitchNetPlugin PRIVATE
-    ${PLUGIN_SOURCES}
-    )
+if(TARGET PitchNetPlugin)
+    target_sources(PitchNetPlugin PRIVATE
+        ${PLUGIN_SOURCES}
+        )
+endif()
 
 # Core/UI libraries (stage 1 modularization)
 add_library(pitchnet_core STATIC ${PITCHNET_CORE_SOURCES})
@@ -488,6 +546,7 @@ target_link_libraries(PitchNet PRIVATE
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags)
 
+if(TARGET PitchNetPlugin)
 target_link_libraries(PitchNetPlugin PRIVATE
     pitchnet_ui
     pitchnet_core
@@ -503,6 +562,7 @@ target_link_libraries(PitchNetPlugin PRIVATE
     juce::juce_recommended_config_flags
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags)
+endif()
 
 if(PITCHNET_ASIO_ENABLED)
     target_include_directories(pitchnet_core PUBLIC ${ASIO_INCLUDE_DIR})
@@ -513,7 +573,7 @@ if(ONNXRUNTIME_FOUND)
     target_include_directories(pitchnet_core PUBLIC ${ONNXRUNTIME_INCLUDE_DIR})
     target_link_libraries(pitchnet_core PUBLIC ${ONNXRUNTIME_LIBRARY})
     target_compile_definitions(pitchnet_core PUBLIC HAVE_ONNXRUNTIME=1)
-    if(APPLE)
+    if(APPLE AND NOT PITCHNET_IOS)
         target_compile_definitions(pitchnet_core PUBLIC ORT_API_MANUAL_INIT=1)
     endif()
 
@@ -766,7 +826,7 @@ if(ONNXRUNTIME_FOUND)
         elseif(USE_DIRECTML)
             message(STATUS "DirectML will be loaded from the system (included in Windows 10/11)")
         endif()
-    elseif(APPLE)
+    elseif(APPLE AND NOT PITCHNET_IOS)
         # macOS: Embed dylib in app bundle and plugin bundles
         get_filename_component(ONNXRUNTIME_LIB_DIR ${ONNXRUNTIME_LIBRARY} DIRECTORY)
         file(GLOB ONNXRUNTIME_DYLIBS "${ONNXRUNTIME_LIB_DIR}/libonnxruntime.*.dylib")
@@ -854,7 +914,9 @@ endif()
 
 # Set C++ standard
 target_compile_features(PitchNet PRIVATE cxx_std_17)
-target_compile_features(PitchNetPlugin PRIVATE cxx_std_17)
+if(TARGET PitchNetPlugin)
+    target_compile_features(PitchNetPlugin PRIVATE cxx_std_17)
+endif()
 
 # Platform-specific settings
 if(WIN32)
@@ -874,6 +936,15 @@ else()
         JUCE_JACK=1)
 endif()
 
+option(PITCHNET_FORCE_MOBILE_UI "Use the touch layout on desktop (for testing)" OFF)
+if(PITCHNET_FORCE_MOBILE_UI)
+    target_compile_definitions(pitchnet_core PUBLIC PITCHNET_MOBILE_UI=1)
+endif()
+if(PITCHNET_IOS)
+    # Mobile exports are handed to the iOS share sheet.
+    target_compile_definitions(pitchnet_core PUBLIC JUCE_CONTENT_SHARING=1)
+endif()
+
 # Common definitions
 target_compile_definitions(pitchnet_core PUBLIC
     PITCHNET_LOGGING_ENABLED=$<NOT:$<OR:$<CONFIG:Release>,$<CONFIG:MinSizeRel>>>
@@ -891,10 +962,12 @@ target_compile_definitions(PitchNet PRIVATE
     JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:PitchNet,JUCE_PRODUCT_NAME>"
     JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:PitchNet,JUCE_VERSION>")
 
+if(TARGET PitchNetPlugin)
 target_compile_definitions(PitchNetPlugin PRIVATE
     JUCE_VST3_CAN_REPLACE_VST2=0
     JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:PitchNetPlugin,JUCE_PRODUCT_NAME>"
     JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:PitchNetPlugin,JUCE_VERSION>")
+endif()
 
 # Check required models
 set(MODELS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Resources/models")
@@ -903,7 +976,7 @@ set(REQUIRED_MODELS
     cent_table.bin
     mel_filterbank.bin
 )
-if(APPLE)
+if(APPLE AND NOT PITCHNET_IOS)
     list(APPEND REQUIRED_MODELS pc_nsf_hifigan.mlmodelc)
 else()
     list(APPEND REQUIRED_MODELS pc_nsf_hifigan.onnx)
@@ -989,8 +1062,28 @@ else()
     message(STATUS "Release runtime resources will be loaded from the platform resource directory")
 endif()
 
+if(PITCHNET_IOS)
+    # iOS bundles are flat. Copy the runtime resources to <app>/Resources so
+    # PlatformPaths finds models and fonts. Xcode signs the bundle after this
+    # step, so the copied files are covered by the signature. Only the runtime
+    # models are copied; the CoreML package is a macOS-only conversion.
+    add_custom_command(TARGET PitchNet POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_DIR:PitchNet>/Resources/models"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${MODELS_DIR}/fcpe.onnx"
+            "${MODELS_DIR}/pc_nsf_hifigan.onnx"
+            "${MODELS_DIR}/cent_table.bin"
+            "${MODELS_DIR}/mel_filterbank.bin"
+            "$<TARGET_BUNDLE_DIR:PitchNet>/Resources/models/"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+            "${GAME_DIR}" "$<TARGET_BUNDLE_DIR:PitchNet>/Resources/models/GAME"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/Resources/fonts" "$<TARGET_BUNDLE_DIR:PitchNet>/Resources/fonts"
+        COMMENT "Copying PitchNet models and fonts into the iOS bundle")
+endif()
+
 # Re-sign bundles on macOS after all resources are copied
-if(APPLE)
+if(APPLE AND NOT PITCHNET_IOS)
     add_custom_command(TARGET PitchNet POST_BUILD
         COMMAND codesign --force --deep -s - "$<TARGET_BUNDLE_DIR:PitchNet>" 2>/dev/null || true
         COMMENT "Re-signing PitchNet bundle")

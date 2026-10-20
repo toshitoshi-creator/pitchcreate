@@ -1,12 +1,8 @@
 name: Build HachiTune
 
+# Inherited from upstream HachiTune and not maintained here; run it manually
+# if needed. The iOS build lives in ios.yml.
 on:
-  push:
-    branches: [main, master, refactor]
-    tags:
-      - "v*"
-  pull_request:
-    branches: [main, master, refactor]
   workflow_dispatch:
 
 env:
