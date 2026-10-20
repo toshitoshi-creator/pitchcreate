@@ -1,0 +1,511 @@
+#pragma once
+
+#include "../Audio/Engine/PluginTransportController.h"
+#include "../Audio/RealtimePitchProcessor.h"
+#include "../JuceHeader.h"
+#include "../UI/IMainView.h"
+#include "../Undo/PitchUndoManager.h"
+#include "HostCompatibility.h"
+#include "NonAraCaptureController.h"
+#include <atomic>
+#include <map>
+#include <set>
+#include <limits>
+#include <memory>
+
+class EditorController;
+class Project;
+class PitchNetDocumentController;
+class PitchNetAudioModification;
+
+/**
+ * PitchNet Audio Processor
+ *
+ * Supports two modes like Melodyne:
+ * 1. ARA Mode: Direct audio access via ARA protocol (Studio One, Cubase, Logic,
+ * etc.)
+ * 2. Non-ARA Mode: Auto-capture and process (FL Studio, Ableton, etc.)
+ *
+ * Exposes 5 host-automatable parameters:
+ * - Bypass: pass through original audio
+ * - Output Gain: post-processing volume (-24 to +12 dB)
+ * - Dry/Wet: blend between original and processed audio (0-100%)
+ * - Pitch Offset: global pitch shift in semitones (-24 to +24 st)
+ * - Formant Shift: formant preservation shift (-12 to +12 st)
+ */
+class PitchNetAudioProcessor : public juce::AudioProcessor, private juce::AsyncUpdater
+#if JucePlugin_Enable_ARA
+    ,
+                                public juce::AudioProcessorARAExtension
+#endif
+{
+public:
+  PitchNetAudioProcessor();
+  ~PitchNetAudioProcessor() override;
+
+  // AudioProcessor interface
+  void prepareToPlay(double sampleRate, int samplesPerBlock) override;
+  void releaseResources() override;
+  void processBlock(juce::AudioBuffer<float> &, juce::MidiBuffer &) override;
+  void processBlockBypassed(juce::AudioBuffer<float> &,
+                            juce::MidiBuffer &) override;
+
+#if !JucePlugin_PreferredChannelConfigurations
+  bool isBusesLayoutSupported(const BusesLayout &layouts) const override;
+#endif
+
+  juce::AudioProcessorEditor *createEditor() override;
+  bool hasEditor() const override { return true; }
+
+  const juce::String getName() const override;
+  bool acceptsMidi() const override;
+  bool producesMidi() const override;
+  bool isMidiEffect() const override;
+  double getTailLengthSeconds() const override {
+    // Keep AU processing alive across silent gaps only while capturing.
+    // Arming/disarming also publishes an AU TailTime property notification.
+    return wrapperType == wrapperType_AudioUnit && isCaptureArmed()
+               ? std::numeric_limits<double>::infinity() : 0.0;
+  }
+
+  int getNumPrograms() override { return 1; }
+  int getCurrentProgram() override { return 0; }
+  void setCurrentProgram(int) override {}
+  const juce::String getProgramName(int) override { return {}; }
+  void changeProgramName(int, const juce::String &) override {}
+
+  void getStateInformation(juce::MemoryBlock &destData) override;
+  void setStateInformation(const void *data, int sizeInBytes) override;
+
+  // Mode detection
+  bool isARAModeActive() const;
+  HostCompatibility::HostInfo getHostInfo() const;
+  juce::String getHostStatusMessage() const;
+
+  // Editor connection
+  void setMainComponent(IMainView *mc);
+  IMainView *getMainComponent() const { return mainComponent; }
+  juce::Point<int> getLastEditorSize() const noexcept {
+    return {lastEditorWidth, lastEditorHeight};
+  }
+  void setLastEditorSize(int width, int height) noexcept {
+    if (width > 0 && height > 0) {
+      lastEditorWidth = width;
+      lastEditorHeight = height;
+    }
+  }
+  PitchUndoManager* getTrackUndoManager(const juce::String& key);
+  std::function<PitchUndoManager*(const juce::String&)> onAraUndoManagerRequested;
+  void bindAraUndoManager(PitchUndoManager* fallback);
+  void requestPluginProjectRender(const Project &project,
+                                  PitchNetAudioModification* target = nullptr);
+  void updateProjectStateFromEditor(const Project &project);
+  void requestCapturedAudioAnalysis(const juce::AudioBuffer<float> &buffer,
+                                    double sampleRate,
+                                    double timelineOffsetSeconds);
+  /** Same archive written straight into a caller-owned stream, so the
+      plug-in state path emits it once instead of staging a second full copy. */
+  bool serializePersistentProjectState(juce::OutputStream &out,
+                                       bool hostBackedARA = false) const;
+  /** The project the two calls above archive, and a cheap content fingerprint
+      of it used to skip re-archiving an unchanged project. The fingerprint is
+      0 when there is nothing cacheable. */
+  const Project *projectForPersistentState() const;
+  std::uint64_t computePersistentStateKey(const juce::String &parametersXml,
+                                          bool hostBackedARA) const;
+  const juce::String &getAraAnalysisProjectJson() const;
+  void invalidateAraAnalysisProjectJson();
+  void setAraAnalysisProjectJson(juce::String json);
+  bool serializePersistentProjectState(juce::MemoryBlock &destData,
+                                       bool hostBackedARA = false) const;
+  bool restorePersistentProjectState(const void *data, size_t sizeInBytes);
+
+
+  // ========== Host Transport Control ==========
+
+  PluginTransportController &getTransportController() {
+    return transportController;
+  }
+
+  void requestHostPlayState(bool shouldPlay) {
+    transportController.requestPlay(shouldPlay);
+  }
+
+  void requestHostStop() { transportController.requestStop(); }
+
+  void requestHostSeek(double timeInSeconds) {
+    transportController.requestSeek(timeInSeconds);
+  }
+
+  void toggleHostPlayPause() { transportController.togglePlayPause(); }
+
+  bool canControlHostTransport() const {
+    return transportController.canControlTransport();
+  }
+
+  // Real-time processor access
+  RealtimePitchProcessor &getRealtimeProcessor() { return realtimeProcessor; }
+  double getHostSampleRate() const { return hostSampleRate; }
+
+#if JucePlugin_Enable_ARA
+  juce::AudioProcessorARAExtension *getARAClientExtensions();
+
+  // Bind the realtime processor to the ARA document controller. Ownership of
+  // the binding lives with the processor (not the editor) so ARA playback keeps
+  // working headlessly after the editor closes; the processor clears it in its
+  // destructor when the realtime processor actually goes away.
+  void setAraDocumentController(PitchNetDocumentController *dc);
+
+  // ARA bind hook: runs when the host binds this instance to ARA, including
+  // when a saved project is loaded with the UI closed. Establishes the
+  // document-controller binding and the headless realtime playback state.
+  void didBindToARA() noexcept override;
+
+  // Make the given ARA playback region the one shown/edited on the canvas.
+  // Each region keeps its own persistent Project; switching saves the outgoing
+  // region's edits and loads the incoming region's project. Called from the
+  // editor when the host selection changes (and, later, from the in-plugin
+  // timeline). Safe to call with a region that has no analysis yet.
+  std::unique_ptr<Project> copyAraRegionProject(const juce::String &key) const;
+  void installAraRegionProject(juce::ARAPlaybackRegion *region,
+                              std::unique_ptr<Project> project);
+  void setActiveAraRegion(juce::ARAPlaybackRegion *region);
+  void updateActiveAraRegionProperties(juce::ARAPlaybackRegion *region);
+  // The active region's span expressed in MODIFICATION time. Projects are
+  // modification-scoped, so this is the only coordinate system they use;
+  // timeline placement is applied at render and draw time, never stored.
+  std::pair<double, double> activeRegionSpanInModificationTime() const;
+  void stampActiveRegionSpan(Project &project) const;
+  // Tell the editor where the active region's content sits on the host
+  // timeline, so the ruler and playhead line up with the drawn waveform.
+  // Display only - nothing in the project moves. May be negative.
+  void pushTimelineDisplayOffset() const;
+  juce::String getActiveAraRegionKey() const { return activeRegionKey; }
+  juce::String getActiveAraRegionSelector() const {
+    return activeRegionSelector;
+  }
+  // Read-only view of a modification's Project, for drawing the regions of a
+  // track in Track mode. For the modification on the canvas this is the live
+  // canvas Project (fromCanvas = true, revision = araCanvasEditSerial, which
+  // moves on every edit); otherwise the stored Project (revision = its store
+  // revision). Loads an inactive modification's saved edit shell and render
+  // on demand; nullptr when no analysis has been saved or loaded yet.
+  // Message thread only; the pointer is valid until the next region
+  // switch/install or edit.
+  const Project *getAraProjectForPreview(PitchNetAudioModification *modification,
+                                         std::uint64_t &revision,
+                                         bool &fromCanvas);
+  void updateAraTrackAnalysisQueue(const std::vector<juce::ARAPlaybackRegion *> &regions);
+  void cancelAraTrackAnalysisQueue();
+  bool isAraCanvasWorkerRunning() const;
+  bool isAraRegionCanvasAnalysisPending() const {
+    return regionCanvasAnalysisPending.load() || trackAnalysisRunning;
+  }
+
+  // Analyse a single region's audio into its own persistent Project (keyed by
+  // regionKey) and, if that region is the active one, show it on the canvas.
+  // Also stores the region's processed audio on its modification so the timeline
+  // clip + per-region playback can read it headlessly (Stage B). Called by the
+  // document controller after extracting one region's audio. Uses a dedicated
+  // controller so it never disturbs the composite analysis / playback pipeline.
+  // True when the project contains actual rendered note edits or global
+  // pitch/formant offsets — only such projects publish per-region
+  // processed audio; unedited regions play their original source.
+  static bool projectHasRegionEdits(const Project &project);
+  void analyzeAraRegionForCanvas(const juce::String &regionKey,
+                                 PitchNetAudioModification *modification,
+                                 juce::int64 startSampleInModification,
+                                 double timelineOffsetSeconds,
+                                 const juce::AudioBuffer<float> &buffer,
+                                 double sampleRate);
+
+  // Clear the selection when the host destroys the selected playback region.
+  // Its Project and undo history belong to the modification and are kept.
+  void forgetAraPlaybackRegion(juce::ARAPlaybackRegion *region);
+  // Drop the canvas binding if it is showing this modification, without
+  // discarding its cached edit state. Used when the host deactivates a
+  // modification into its undo history, where the object survives and can be
+  // reactivated by redo.
+  void releaseAraModificationCanvas(PitchNetAudioModification *modification);
+  // Release the canvas binding and discard every cached Project and undo
+  // history belonging to this modification. Used when it is destroyed.
+  void forgetAraModification(PitchNetAudioModification *modification);
+
+  // Per-region project persistence. ARA archives omit both project waveforms
+  // and the global mel spectrogram because they are rebuilt from the host
+  // source. The rendered waveform uses the modification's processed-region
+  // audio when available; otherwise the region remains source-backed. Edit
+  // data remains archived. serialize returns false if no project is cached for
+  // regionKey.
+  bool serializeAraRegionProject(const juce::String &regionKey,
+                                 juce::MemoryBlock &out) const;
+  bool hasAraRegionProject(const juce::String &regionKey) const;
+  bool araRegionProjectNeedsSourceHydration(
+      const juce::String &regionKey) const;
+  bool hydrateAraRegionProject(const juce::String &regionKey,
+                               const juce::AudioBuffer<float> &sourceBuffer,
+                               double sourceSampleRate);
+  bool araRegionProjectAppearsToCover(const juce::String &regionKey,
+                                      double regionStart,
+                                      double regionEnd) const;
+  bool restoredAraProjectAppearsToCover(double regionStart,
+                                        double regionEnd) const;
+  void restoreAraRegionProject(const juce::String &regionKey, const void *data,
+                               size_t sizeInBytes);
+  // Finish a pending active-region switch when analysis data was found in an
+  // archive/cache instead of being produced by a new analysis job.
+  bool showAraRegionProjectIfActive(const juce::String &regionKey);
+#endif
+
+  // Non-ARA mode: edit preview. Auditions a frame range of the synthesized
+  // result while the host transport is stopped, mirroring the ARA editor
+  // renderer's preview. These are no-ops in an ARA host, where processNonARAMode
+  // never runs and the ARA preview path handles auditioning instead.
+  void startPluginPreview(double startSeconds, double endSeconds);
+  void stopPluginPreview();
+  void startPluginAudition(const juce::AudioBuffer<float> &buffer,
+                           double sampleRate);
+  void stopPluginAudition();
+
+  // Non-ARA mode: capture control
+  void startCapture();
+  void stopCapture();
+  bool isCapturing() const {
+    return captureController && captureController->getState() ==
+                                    NonAraCaptureController::State::Capturing;
+  }
+  bool isCaptureArmed() const {
+    if (!captureController)
+      return false;
+    const auto state = captureController->getState();
+    return state == NonAraCaptureController::State::WaitingForAudio ||
+           state == NonAraCaptureController::State::Capturing;
+  }
+
+  // ========== Parameter Access ==========
+
+  juce::AudioProcessorValueTreeState &getAPVTS() { return apvts; }
+
+  // Parameter IDs (stable across versions for automation compatibility)
+  static constexpr const char *PARAM_BYPASS = "bypass";
+  static constexpr const char *PARAM_OUTPUT_GAIN = "outputGain";
+  static constexpr const char *PARAM_DRY_WET = "dryWet";
+  static constexpr const char *PARAM_PITCH_OFFSET = "pitchOffset";
+  static constexpr const char *PARAM_FORMANT_SHIFT = "formantShift";
+
+private:
+  void handleAsyncUpdate() override;
+
+  struct HostUiSyncState {
+    std::atomic<double> latestSeconds{0.0};
+    std::atomic<bool> posPending{false};
+    std::atomic<bool> stoppedPending{false};
+  };
+
+  void processNonARAMode(juce::AudioBuffer<float> &buffer,
+                         const juce::AudioPlayHead::PositionInfo &posInfo,
+                         bool isRealtime);
+  void disarmCaptureUi();
+  void dispatchLiveCaptureUpdate();
+
+  /** Render the non-ARA edit preview into the buffer. Returns true if preview
+   *  is active (and produced output or intentional silence), false to let the
+   *  normal stopped-transport handling proceed. Audio thread only. */
+  bool processPluginPreview(juce::AudioBuffer<float> &buffer);
+
+  /** Apply bypass, dry/wet mix, and output gain to the processed buffer. */
+  void applyOutputProcessing(juce::AudioBuffer<float> &processedBuffer,
+                             const juce::AudioBuffer<float> &dryBuffer);
+
+  /** Bind the realtime processor to the persistent backend snapshot when no
+   *  editor is present (headless playback / bounce). This copies/resamples the
+   *  project waveform, so call it only from lifecycle/state-update paths and
+   *  never from processBlock(). No-op if an editor is open or no analyzed
+   *  snapshot exists yet. */
+  void bindRealtimeProcessorHeadless();
+
+#if JucePlugin_Enable_ARA
+  /** Establish the full headless ARA binding (document-controller pointer,
+   *  persistence callbacks, and realtime playback snapshot) at the correct,
+   *  already-prepared sample rate. Safe to call repeatedly; no-op for the
+   *  realtime bind while an editor is open. */
+  void ensureHeadlessAraBinding();
+#endif
+
+  /** Detect parameter changes on audio thread and dispatch to message thread. */
+  void checkParameterChanges();
+  bool restoreProjectJsonToProcessorState(const juce::String &projectJson);
+  void publishPersistentProjectSnapshot(const Project &project);
+  void attachMacroParameters(Project &project);
+  void adoptMacroParameters(Project &project);
+
+  static juce::AudioProcessorValueTreeState::ParameterLayout
+  createParameterLayout();
+
+  // APVTS (must be declared after AudioProcessor base is constructed)
+  juce::AudioProcessorValueTreeState apvts;
+
+  // Raw parameter value pointers for lock-free audio-thread access
+  std::atomic<float> *bypassParamValue = nullptr;
+  std::atomic<float> *outputGainParamValue = nullptr;
+  std::atomic<float> *dryWetParamValue = nullptr;
+  std::atomic<float> *pitchOffsetParamValue = nullptr;
+  std::atomic<float> *formantShiftParamValue = nullptr;
+
+  // Cached parameter values for change detection (audio thread only)
+  float cachedPitchOffset = 0.0f;
+  float cachedFormantShift = 0.0f;
+  std::shared_ptr<MacroParameters> macroParameters =
+      std::make_shared<MacroParameters>();
+
+  // Debounced parameter sync: audio thread -> message thread -> project
+  struct ParamSyncState {
+    std::atomic<bool> pending{false};
+    std::atomic<float> pitchOffset{0.0f};
+    std::atomic<float> formantShift{0.0f};
+    std::atomic<bool> needsResynth{false};
+  };
+  std::shared_ptr<ParamSyncState> paramSyncState =
+      std::make_shared<ParamSyncState>();
+
+  PluginTransportController transportController;
+  RealtimePitchProcessor realtimeProcessor;
+#if JucePlugin_Enable_ARA
+  PitchNetDocumentController *araDocumentController = nullptr;
+#endif
+  IMainView *mainComponent = nullptr;
+  // Hosts commonly destroy the editor when its window closes while retaining
+  // the processor instance. Keep the most recent editor dimensions here so a
+  // subsequently created editor can resume at the same size.
+  int lastEditorWidth = 0;
+  int lastEditorHeight = 0;
+  std::shared_ptr<HostUiSyncState> hostUiSyncState =
+      std::make_shared<HostUiSyncState>();
+  double hostSampleRate = 44100.0;
+
+  juce::String pendingStateJson;
+  std::unique_ptr<EditorController> araAnalysisController;
+  std::unique_ptr<EditorController> araIncrementalAnalysisController;
+  std::unique_ptr<PitchUndoManager> undoManager;
+  std::map<juce::String, std::unique_ptr<PitchUndoManager>> trackUndoManagers;
+  juce::String activeUndoTrackKey;
+  MainViewViewportState viewportState;
+  std::uintptr_t araAnalysisSourceKey = 0;
+  bool araAnalysisLoading = false;
+  bool araAnalysisReady = false;
+  double araAnalysisTimelineOffsetSeconds = 0.0;
+  std::unique_ptr<Project> araAnalysisProjectSnapshot;
+  // Built on demand from araAnalysisProjectSnapshot. Serialising a
+  // multi-minute take to JSON text costs tens of MB of string work, and
+  // nothing in non-ARA plug-in mode ever reads it, so only pay for it where it
+  // is actually used.
+  mutable juce::String araAnalysisProjectJson;
+  mutable bool araAnalysisProjectJsonValid = false;
+  // Last blob handed to the host, keyed by content. Costs one extra resident
+  // copy of the plug-in state in exchange for making repeat host saves free.
+  juce::MemoryBlock cachedPluginStateBlock;
+  std::uint64_t cachedPluginStateKey = 0;
+  std::atomic<bool> araRenderPendingRerun{false};
+  struct ModificationRenderState {
+    std::unique_ptr<EditorController> controller;
+    std::atomic<bool> pending{false};
+  };
+  std::map<juce::String, ModificationRenderState> modificationRenders;
+
+  struct AraRegionState {
+    std::uint64_t revision = 0;
+    std::unique_ptr<Project> project;
+    std::unique_ptr<PitchUndoManager> undoManager;
+
+    PitchUndoManager *ensureUndoManager() {
+      if (!undoManager)
+        undoManager = std::make_unique<PitchUndoManager>(100);
+      return undoManager.get();
+    }
+  };
+
+  // The active Project temporarily moves into the editor controller; inactive
+  // Projects remain here. Moving ownership preserves the object identity and
+  // raw pointers retained by that region's undo actions.
+  std::map<juce::String, AraRegionState> araRegions;
+  juce::String activeRegionKey;
+  // Bumped whenever the canvas Project changes, so Track-mode previews of the
+  // active modification's other regions can tell when to rebuild.
+  std::uint64_t araCanvasEditSerial = 0;
+  // The selected window onto activeRegionKey's modification. Siblings share
+  // the key, so this is what distinguishes them for selection and placement.
+  juce::String activeRegionSelector;
+  // True only while the canvas is showing the ACTIVE REGION's own (region-local)
+  // project. onProjectDataChanged fires for every project change — including
+  // completion of the composite/document analysis, whose waveform is anchored to
+  // the whole timeline. Publishing that composite as the region's processed
+  // audio made the renderer play the composite's leading silence at the region
+  // position. The flag lets updateProjectStateFromEditor publish per-region
+  // audio only when the canvas project is actually the region's own.
+  bool canvasShowsActiveAraRegion = false;
+  // The active region's modification + its start in the modification, tracked so
+  // edits can be re-published onto the modification (resynth-on-edit) and stay
+  // in sync for headless/persisted per-region playback.
+  PitchNetAudioModification *activeModification = nullptr;
+  juce::int64 activeStartSampleInModification = 0;
+  double activeRegionStartSeconds = 0.0;
+  double activeRegionEndSeconds = 0.0;
+  // Dedicated controller for per-region canvas analysis, kept separate from the
+  // composite araAnalysisController so the two never interfere.
+  std::unique_ptr<EditorController> regionCanvasController;
+  // While a region-local Project is being built, document/composite analysis
+  // must not take over the canvas or hide the region's progress popup.
+  std::atomic<bool> regionCanvasAnalysisPending{false};
+  std::atomic<std::uint64_t> regionCanvasAnalysisGeneration{0};
+  juce::String pendingRegionCanvasAnalysisKey;
+  // Message-thread queue bookkeeping; never retain host-owned region pointers.
+  std::set<juce::String> trackAnalysisAttempted;
+  bool trackAnalysisRunning = false;
+  bool trackAnalysisCancelled = false;
+  int trackAnalysisTotal = 0;
+  int trackAnalysisFinished = 0;
+  int trackAnalysisFailed = 0;
+
+  std::atomic<bool> regionCanvasRenderPendingRerun{false};
+
+  // Non-ARA capture (Stage 2A): decoupled controller
+  std::shared_ptr<NonAraCaptureController> captureController =
+      std::make_shared<NonAraCaptureController>();
+  NonAraCaptureController::State lastCaptureUiState =
+      NonAraCaptureController::State::Idle;
+  struct LiveCaptureUiState {
+    std::atomic<bool> pending{false};
+    std::atomic<int> latestSamples{0};
+    std::atomic<int> sentSamples{0};
+    std::atomic<unsigned int> generation{0};
+    std::atomic<double> timelineOffsetSeconds{0.0};
+  };
+  std::shared_ptr<LiveCaptureUiState> liveCaptureUiState =
+      std::make_shared<LiveCaptureUiState>();
+  double captureTimelineOffsetSeconds = 0.0;
+  static constexpr int MAX_CAPTURE_SECONDS = 300; // 5 minutes max
+
+  // Non-ARA edit preview. Written from the message thread, consumed on the
+  // audio thread; pluginPreviewCursor is audio-thread only.
+  struct PluginPreviewState {
+    std::atomic<bool> active{false};
+    std::atomic<bool> restart{false};
+    std::atomic<double> startSeconds{0.0};
+    std::atomic<double> endSeconds{0.0};
+  };
+  PluginPreviewState pluginPreview;
+  juce::int64 pluginPreviewCursor = 0;
+  std::shared_ptr<juce::AudioBuffer<float>> pluginAuditionBuffer;
+  // Audio-thread-only handoff state for crossfading new audition renders.
+  std::shared_ptr<juce::AudioBuffer<float>> activePluginAuditionBuffer;
+  std::shared_ptr<juce::AudioBuffer<float>> previousPluginAuditionBuffer;
+  juce::int64 pluginAuditionCursor = 0;
+  juce::int64 previousPluginAuditionCursor = 0;
+  int pluginAuditionTransitionRemaining = 0;
+  int pluginAuditionTransitionTotal = 0;
+
+  // Plugin state version for forward/backward compatibility
+  static constexpr int PLUGIN_STATE_VERSION = 1;
+
+  JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PitchNetAudioProcessor)
+};

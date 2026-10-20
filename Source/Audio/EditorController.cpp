@@ -1,0 +1,1459 @@
+#include "EditorController.h"
+#include "../Utils/NoteAmplitude.h"
+#include "../Utils/AudioResampler.h"
+#include "../Utils/SHA256Utils.h"
+#include "../Utils/ScaleUtils.h"
+#include "../Utils/Constants.h"
+#include "../Utils/F0Smoother.h"
+#include "../Utils/Localization.h"
+#include "../Utils/MelSpectrogram.h"
+#include "../Utils/PitchCurveProcessor.h"
+#include "../Utils/PlatformPaths.h"
+
+#include <algorithm>
+#include <climits>
+#include <cmath>
+#include <mutex>
+
+namespace
+{
+std::mutex &getDirectMLModelLoadMutex()
+{
+  static std::mutex mutex;
+  return mutex;
+}
+} // namespace
+
+EditorController::EditorController(bool enableAudioDevice)
+{
+  project = std::make_unique<Project>();
+  if (enableAudioDevice)
+    audioEngine = std::make_unique<AudioEngine>();
+
+  fcpePitchDetector = std::make_unique<FCPEPitchDetector>();
+  rmvpePitchDetector = std::make_unique<RMVPEPitchDetector>();
+  gameDetector = std::make_unique<GAMEDetector>();
+  vocoder = std::make_unique<Vocoder>();
+  incrementalSynth = std::make_unique<IncrementalSynthesizer>();
+  playbackController = std::make_unique<PlaybackController>();
+
+  fcpeModelPath = PlatformPaths::getModelFile("fcpe.onnx");
+  melFilterbankPath = PlatformPaths::getModelFile("mel_filterbank.bin");
+  centTablePath = PlatformPaths::getModelFile("cent_table.bin");
+  rmvpeModelPath = PlatformPaths::getModelFile("rmvpe.onnx");
+  gameModelDir = PlatformPaths::getModelSubDir("GAME", "encoder.onnx");
+
+  incrementalSynth->setVocoder(vocoder.get());
+  incrementalSynth->setSynthesisEngine(synthesisEngineType);
+  if (audioEngine)
+    playbackController->setAudioEngine(audioEngine.get());
+}
+
+void EditorController::requestShutdown()
+{
+  shuttingDown.store(true);
+  cancelLoadingFlag.store(true);
+  hostAnalysisJobId.fetch_add(1);
+  if (incrementalSynth)
+    incrementalSynth->cancel();
+  if (vocoder)
+    vocoder->requestShutdown();
+}
+
+EditorController::~EditorController()
+{
+  requestShutdown();
+  if (modelReloadThread.joinable())
+    modelReloadThread.join();
+  if (loaderThread.joinable())
+    loaderThread.join();
+  if (loaderJoinerThread.joinable())
+    loaderJoinerThread.join();
+}
+
+void EditorController::setProject(std::unique_ptr<Project> newProject)
+{
+  project = std::move(newProject);
+}
+
+GPUProvider EditorController::getProviderFromDevice(
+    const juce::String &deviceName) const
+{
+  if (deviceName == "CUDA")
+    return GPUProvider::CUDA;
+  if (deviceName == "DirectML")
+    return GPUProvider::DirectML;
+  if (deviceName == "CoreML")
+    return GPUProvider::CoreML;
+  if (deviceName.isNotEmpty() && deviceName != "CPU")
+    LOG("Unsupported pitch detector device: " + deviceName + ", using CPU");
+  return GPUProvider::CPU;
+}
+
+void EditorController::reloadInferenceModels(bool async)
+{
+  if (shuttingDown.load())
+    return;
+  auto provider = getProviderFromDevice(device);
+  int resolvedDeviceId = deviceId < 0 ? 0 : deviceId;
+
+  auto fcpePath = fcpeModelPath;
+  auto melPath = melFilterbankPath;
+  auto centPath = centTablePath;
+  auto rmvpePath = rmvpeModelPath;
+  auto gamePath = gameModelDir;
+  auto reloadTask = [device = device,
+                     provider,
+                     resolvedDeviceId,
+                     fcpePath,
+                     melPath,
+                     centPath,
+                     rmvpePath,
+                     gamePath](EditorController *self)
+  {
+    if (!self || self->shuttingDown.load())
+      return;
+
+    // ONNX Runtime DirectML 1.18/1.19 can crash inside the GPU driver when
+    // multiple sessions for the same device are created concurrently. This is
+    // especially easy to trigger in optimized builds, where model setup
+    // overlaps much more tightly. Keep DirectML session creation on this one
+    // loader thread; CPU and other providers retain parallel startup.
+    if (provider == GPUProvider::DirectML)
+    {
+      const std::lock_guard<std::mutex> directMLLoadLock(
+          getDirectMLModelLoadMutex());
+      LOG("EditorController: serializing DirectML model loading");
+
+      if (!self->shuttingDown.load() && self->fcpePitchDetector && fcpePath.existsAsFile())
+      {
+        if (self->shuttingDown.load())
+          return;
+        LOG("EditorController: loading FCPE model (device " + device +
+            ", id " + juce::String(resolvedDeviceId) + ")...");
+        if (self->fcpePitchDetector->loadModel(fcpePath, melPath, centPath,
+                                               provider, resolvedDeviceId))
+          LOG("FCPE pitch detector loaded successfully");
+        else
+          LOG("Failed to load FCPE model");
+      }
+      else if (self->fcpePitchDetector)
+      {
+        LOG("FCPE model not found at: " + fcpePath.getFullPathName());
+      }
+
+      if (!self->shuttingDown.load() && self->rmvpePitchDetector && rmvpePath.existsAsFile())
+      {
+        if (self->shuttingDown.load())
+          return;
+        LOG("EditorController: loading RMVPE model (device " + device +
+            ", id " + juce::String(resolvedDeviceId) + ")...");
+        if (self->rmvpePitchDetector->loadModel(rmvpePath, provider,
+                                                resolvedDeviceId))
+          LOG("RMVPE pitch detector loaded successfully");
+        else
+          LOG("Failed to load RMVPE model");
+      }
+      else if (self->rmvpePitchDetector)
+      {
+        LOG("RMVPE model not found at: " + rmvpePath.getFullPathName());
+      }
+
+      if (!self->shuttingDown.load() && self->gameDetector && gamePath.isDirectory())
+      {
+        if (self->shuttingDown.load())
+          return;
+        LOG("EditorController: loading GAME models from " +
+            gamePath.getFullPathName() + " (device " + device + ", id " +
+            juce::String(resolvedDeviceId) + ")...");
+        if (self->gameDetector->loadModels(gamePath, provider,
+                                           resolvedDeviceId))
+          LOG("GAME detector loaded successfully, isLoaded=" +
+              juce::String(self->gameDetector->isLoaded() ? "true" :
+                                                               "false"));
+        else
+          LOG("Failed to load GAME models from " +
+              gamePath.getFullPathName());
+      }
+      else if (self->gameDetector)
+      {
+        LOG("GAME model directory not found: " + gamePath.getFullPathName() +
+            " isDirectory=" +
+            juce::String(gamePath.isDirectory() ? "true" : "false"));
+      }
+      else
+      {
+        LOG("GAME detector not created (gameDetector is null)");
+      }
+
+      return;
+    }
+
+    // Load all models in parallel — each operates on an independent object
+    // with its own Ort::Env, so no shared state.
+    std::thread fcpeThread;
+    std::thread rmvpeThread;
+    std::thread gameThread;
+
+    if (!self->shuttingDown.load() && self->fcpePitchDetector && fcpePath.existsAsFile())
+    {
+      fcpeThread = std::thread([&]()
+                               {
+        if (self->shuttingDown.load())
+          return;
+        LOG("EditorController: loading FCPE model (device " + device +
+            ", id " + juce::String(resolvedDeviceId) + ")...");
+        if (self->fcpePitchDetector->loadModel(fcpePath, melPath, centPath,
+                                               provider, resolvedDeviceId)) {
+          LOG("FCPE pitch detector loaded successfully");
+        } else {
+          LOG("Failed to load FCPE model");
+        } });
+    }
+    else if (self->fcpePitchDetector)
+    {
+      LOG("FCPE model not found at: " + fcpePath.getFullPathName());
+    }
+
+    if (!self->shuttingDown.load() && self->rmvpePitchDetector && rmvpePath.existsAsFile())
+    {
+      rmvpeThread = std::thread([&]()
+                                {
+        if (self->shuttingDown.load())
+          return;
+        LOG("EditorController: loading RMVPE model (device " + device +
+            ", id " + juce::String(resolvedDeviceId) + ")...");
+        if (self->rmvpePitchDetector->loadModel(rmvpePath, provider,
+                                                resolvedDeviceId)) {
+          LOG("RMVPE pitch detector loaded successfully");
+        } else {
+          LOG("Failed to load RMVPE model");
+        } });
+    }
+    else if (self->rmvpePitchDetector)
+    {
+      LOG("RMVPE model not found at: " + rmvpePath.getFullPathName());
+    }
+
+    if (!self->shuttingDown.load() && self->gameDetector && gamePath.isDirectory())
+    {
+      gameThread = std::thread([&]()
+                               {
+        if (self->shuttingDown.load())
+          return;
+        LOG("EditorController: loading GAME models from " + gamePath.getFullPathName() +
+            " (device " + device + ", id " + juce::String(resolvedDeviceId) + ")...");
+        if (self->gameDetector->loadModels(gamePath, provider,
+                                           resolvedDeviceId)) {
+          LOG("GAME detector loaded successfully, isLoaded=" +
+              juce::String(self->gameDetector->isLoaded() ? "true" : "false"));
+        } else {
+          LOG("Failed to load GAME models from " + gamePath.getFullPathName());
+        } });
+    }
+    else if (self->gameDetector)
+    {
+      LOG("GAME model directory not found: " + gamePath.getFullPathName() +
+          " isDirectory=" + juce::String(gamePath.isDirectory() ? "true" : "false"));
+    }
+    else
+    {
+      LOG("GAME detector not created (gameDetector is null)");
+    }
+
+    // Wait for all parallel loads to complete
+    if (fcpeThread.joinable())
+      fcpeThread.join();
+    if (rmvpeThread.joinable())
+      rmvpeThread.join();
+    if (gameThread.joinable())
+      gameThread.join();
+  };
+
+  if (!async)
+  {
+    reloadTask(this);
+    return;
+  }
+
+  if (isReloadingModels.exchange(true))
+    return;
+
+  if (modelReloadThread.joinable())
+    modelReloadThread.join();
+
+  modelReloadThread = std::thread([this, reloadTask]() mutable
+                                  {
+    reloadTask(this);
+    isReloadingModels = false; });
+}
+
+bool EditorController::isInferenceBusy() const
+{
+  if (incrementalSynth && incrementalSynth->isSynthesizing())
+    return true;
+  if (isReloadingModels.load())
+    return true;
+  return false;
+}
+
+bool EditorController::isSelectedPitchDetectorLoaded() const
+{
+  if (pitchDetectorType == PitchDetectorType::FCPE)
+    return fcpePitchDetector && fcpePitchDetector->isLoaded();
+  if (pitchDetectorType == PitchDetectorType::RMVPE)
+    return rmvpePitchDetector && rmvpePitchDetector->isLoaded();
+  return false;
+}
+
+void EditorController::requestCancelLoading()
+{
+  cancelLoadingFlag = true;
+}
+
+void EditorController::loadAudioFileAsync(
+    const juce::File &file,
+    const ProgressCallback &onProgress,
+    const LoadCompleteCallback &onComplete,
+    const CancelCallback &onCancelled)
+{
+  if (isLoadingAudio.load())
+    return;
+
+  cancelLoadingFlag = false;
+  isLoadingAudio = true;
+
+  if (loaderThread.joinable())
+    loaderThread.join();
+
+  loaderThread = std::thread([this, file, onProgress, onComplete, onCancelled]()
+                             {
+    auto updateProgress = [&](double p, const juce::String &msg) {
+      if (onProgress)
+        onProgress(p, msg);
+    };
+
+    updateProgress(0.04, TR("progress.loading_audio"));
+
+    juce::AudioFormatManager formatManager;
+    formatManager.registerBasicFormats();
+
+    std::unique_ptr<juce::AudioFormatReader> reader(
+        formatManager.createReaderFor(file));
+    if (reader == nullptr || cancelLoadingFlag.load()) {
+      isLoadingAudio = false;
+      if (onCancelled)
+        juce::MessageManager::callAsync(onCancelled);
+      return;
+    }
+
+    const int numSamples = static_cast<int>(reader->lengthInSamples);
+    const int srcSampleRate = static_cast<int>(reader->sampleRate);
+
+    juce::AudioBuffer<float> buffer(1, numSamples);
+
+    updateProgress(0.08, TR("progress.reading_audio"));
+    if (reader->numChannels == 1) {
+      reader->read(&buffer, 0, numSamples, 0, true, false);
+    } else {
+      juce::AudioBuffer<float> stereoBuffer(2, numSamples);
+      reader->read(&stereoBuffer, 0, numSamples, 0, true, true);
+
+      const float *left = stereoBuffer.getReadPointer(0);
+      const float *right = stereoBuffer.getReadPointer(1);
+      float *mono = buffer.getWritePointer(0);
+
+      for (int i = 0; i < numSamples; ++i)
+        mono[i] = (left[i] + right[i]) * 0.5f;
+    }
+
+    if (cancelLoadingFlag.load()) {
+      isLoadingAudio = false;
+      if (onCancelled)
+        juce::MessageManager::callAsync(onCancelled);
+      return;
+    }
+
+    if (srcSampleRate != SAMPLE_RATE) {
+      updateProgress(0.14, TR("progress.resampling"));
+      const double ratio = static_cast<double>(srcSampleRate) / SAMPLE_RATE;
+      const int newNumSamples = static_cast<int>(numSamples / ratio);
+
+      juce::AudioBuffer<float> resampledBuffer(1, newNumSamples);
+      const float *src = buffer.getReadPointer(0);
+      float *dst = resampledBuffer.getWritePointer(0);
+
+      for (int i = 0; i < newNumSamples; ++i) {
+        const double srcPos = i * ratio;
+        const int srcIndex = static_cast<int>(srcPos);
+        const double frac = srcPos - srcIndex;
+
+        if (srcIndex + 1 < numSamples)
+          dst[i] = static_cast<float>(src[srcIndex] * (1.0 - frac) +
+                                      src[srcIndex + 1] * frac);
+        else
+          dst[i] = src[srcIndex];
+      }
+
+      buffer = std::move(resampledBuffer);
+    }
+
+    updateProgress(0.15, TR("progress.preparing_project"));
+    auto newProject = std::make_unique<Project>();
+    newProject->setFilePath(file);
+    newProject->setAudioSha256(SHA256Utils::fileSHA256(file));
+    auto &audioData = newProject->getAudioData();
+    audioData.waveform = std::move(buffer);
+    audioData.sampleRate = SAMPLE_RATE;
+
+    if (cancelLoadingFlag.load()) {
+      isLoadingAudio = false;
+      if (onCancelled)
+        juce::MessageManager::callAsync(onCancelled);
+      return;
+    }
+
+    updateProgress(0.17, TR("progress.analyzing_audio"));
+    analyzeAudio(*newProject, updateProgress);
+
+    if (cancelLoadingFlag.load()) {
+      isLoadingAudio = false;
+      if (onCancelled)
+        juce::MessageManager::callAsync(onCancelled);
+      return;
+    }
+
+    updateProgress(0.95, TR("progress.finalizing"));
+
+    // Store pristine original waveform in AudioData for blend-based synthesis
+    audioData.originalWaveform.makeCopyOf(audioData.waveform);
+
+    juce::AudioBuffer<float> originalWaveform;
+    originalWaveform.makeCopyOf(audioData.waveform);
+
+    juce::MessageManager::callAsync(
+        [this, project = std::move(newProject),
+         original = std::move(originalWaveform), onComplete]() mutable {
+          setProject(std::move(project));
+          isLoadingAudio = false;
+          if (onComplete)
+            onComplete(original);
+        }); });
+}
+
+void EditorController::setHostAudioAsync(
+    const juce::AudioBuffer<float> &buffer,
+    double sampleRate,
+    const ProgressCallback &onProgress,
+    const LoadCompleteCallback &onComplete)
+{
+  isLoadingAudio = true;
+  cancelLoadingFlag.store(true);
+  if (loaderThread.joinable())
+  {
+    if (loaderJoinerThread.joinable())
+      loaderJoinerThread.join();
+    auto old = std::move(loaderThread);
+    loaderJoinerThread = std::thread([t = std::move(old)]() mutable
+                                     {
+      if (t.joinable())
+        t.join(); });
+  }
+  cancelLoadingFlag.store(false);
+
+  const auto jobId = hostAnalysisJobId.fetch_add(1) + 1;
+
+  loaderThread = std::thread([this, buffer, sampleRate, onProgress, onComplete, jobId]() mutable
+                             {
+    if (cancelLoadingFlag.load() || hostAnalysisJobId.load() != jobId)
+    {
+      isLoadingAudio = false;
+      return;
+    }
+
+    if (!isSelectedPitchDetectorLoaded())
+    {
+      if (onProgress)
+        onProgress(0.05, TR("progress.loading"));
+      reloadInferenceModels(false);
+    }
+
+    if (cancelLoadingFlag.load() || hostAnalysisJobId.load() != jobId)
+    {
+      isLoadingAudio = false;
+      return;
+    }
+
+    juce::AudioBuffer<float> resampledBuffer;
+    const double inputSampleRate = sampleRate;
+    if (inputSampleRate > 0.0 &&
+        std::abs(inputSampleRate - static_cast<double>(SAMPLE_RATE)) > 1e-6) {
+      resampledBuffer = AudioResampler::resample(
+          buffer, inputSampleRate, static_cast<double>(SAMPLE_RATE));
+    }
+
+    const juce::AudioBuffer<float> &stored =
+        resampledBuffer.getNumSamples() > 0 ? resampledBuffer : buffer;
+    const double storedSampleRate = resampledBuffer.getNumSamples() > 0
+                                        ? static_cast<double>(SAMPLE_RATE)
+                                        : inputSampleRate;
+
+    auto projectCopy = std::make_unique<Project>();
+    projectCopy->getAudioData().waveform = stored;
+    projectCopy->getAudioData().sampleRate = static_cast<int>(storedSampleRate);
+
+    auto updateProgress = [&](double p, const juce::String &msg) {
+      if (cancelLoadingFlag.load() || hostAnalysisJobId.load() != jobId)
+        return;
+      if (onProgress)
+        onProgress(p, msg);
+    };
+
+    analyzeAudio(*projectCopy, updateProgress);
+
+    if (cancelLoadingFlag.load() || hostAnalysisJobId.load() != jobId)
+    {
+      isLoadingAudio = false;
+      return;
+    }
+
+    // Store pristine original waveform in AudioData for blend-based synthesis
+    projectCopy->getAudioData().originalWaveform.makeCopyOf(projectCopy->getAudioData().waveform);
+
+    juce::AudioBuffer<float> originalWaveform;
+    originalWaveform.makeCopyOf(projectCopy->getAudioData().waveform);
+
+    juce::MessageManager::callAsync(
+        [this, project = std::move(projectCopy),
+         original = std::move(originalWaveform), onComplete, jobId]() mutable {
+          if (hostAnalysisJobId.load() != jobId)
+            return;
+          setProject(std::move(project));
+          isLoadingAudio = false;
+          if (onComplete)
+            onComplete(original);
+        }); });
+}
+
+void EditorController::resynthesizeIncrementalAsync(
+    Project &project,
+    const std::function<void(const juce::String &)> &onProgress,
+    const std::function<void(bool)> &onComplete,
+    std::atomic<bool> &pendingRerun,
+    bool isPluginMode)
+{
+  auto *synth = incrementalSynth.get();
+  if (!synth || !vocoder)
+  {
+    if (onComplete)
+      onComplete(false);
+    return;
+  }
+
+  if (synth->isSynthesizing())
+  {
+    pendingRerun.store(true);
+    synth->cancel();
+    return;
+  }
+
+  auto &audioData = project.getAudioData();
+  if (audioData.melSpectrogram.empty() || audioData.f0.empty())
+  {
+    if (onComplete)
+      onComplete(false);
+    return;
+  }
+  if (!vocoder->isLoaded())
+  {
+    if (onProgress)
+      onProgress(TR("progress.loading_vocoder"));
+
+    auto modelPath = PlatformPaths::getVocoderModelFile();
+    if (!modelPath.exists() || !vocoder->loadModel(modelPath))
+    {
+      if (onComplete)
+        onComplete(false);
+      return;
+    }
+  }
+
+  if (!project.hasDirtyNotes() && !project.hasF0DirtyRange())
+  {
+    if (onComplete)
+      onComplete(false);
+    return;
+  }
+
+  auto [dirtyStart, dirtyEnd] = project.getDirtyFrameRange();
+  if (dirtyStart < 0 || dirtyEnd < 0)
+  {
+    if (onComplete)
+      onComplete(false);
+    return;
+  }
+
+  synth->setProject(&project);
+  synth->setVocoder(vocoder.get());
+  synth->setSynthesisEngine(synthesisEngineType);
+  pendingRerun.store(false);
+
+  if (onProgress)
+    onProgress(TR("progress.synthesizing"));
+
+  AudioEngine *audioEnginePtr = nullptr;
+  if (!isPluginMode && audioEngine)
+    audioEnginePtr = audioEngine.get();
+
+  synth->synthesizeRegion(
+      [onProgress](const juce::String &message)
+      {
+        if (onProgress)
+          onProgress(message);
+      },
+      [this, projectPtr = &project, pending = &pendingRerun, onComplete,
+       audioEnginePtr, isPluginMode](bool success)
+      {
+        if (!success)
+        {
+          if (pending->exchange(false))
+          {
+            juce::MessageManager::callAsync([this, projectPtr, pending, onComplete,
+                                             audioEnginePtr, isPluginMode]()
+                                            { resynthesizeIncrementalAsync(*projectPtr, nullptr, onComplete,
+                                                                           *pending, isPluginMode); });
+          }
+          else if (onComplete)
+          {
+            onComplete(false);
+          }
+          return;
+        }
+
+        if (audioEnginePtr && !isPluginMode)
+        {
+          auto &audioData = projectPtr->getAudioData();
+          try
+          {
+            audioEnginePtr->loadWaveform(audioData.waveform,
+                                         audioData.sampleRate, true);
+          }
+          catch (...)
+          {
+          }
+        }
+
+        if (onComplete)
+          onComplete(true);
+
+        if (pending->exchange(false))
+        {
+          juce::MessageManager::callAsync([this, projectPtr, pending, onComplete,
+                                           audioEnginePtr, isPluginMode]()
+                                          { resynthesizeIncrementalAsync(*projectPtr, nullptr, onComplete,
+                                                                         *pending, isPluginMode); });
+        }
+      });
+}
+
+void EditorController::analyzeAudio(
+    Project &targetProject,
+    const std::function<void(double, const juce::String &)> &onProgress,
+    std::function<void()> onComplete)
+{
+  if (shuttingDown.load())
+    return;
+
+  auto &audioData = targetProject.getAudioData();
+  if (audioData.waveform.getNumSamples() == 0)
+    return;
+
+  auto showMissingModelAndAbort = [](const juce::String &modelName,
+                                     const juce::File &path)
+  {
+    juce::MessageManager::callAsync([modelName, path]()
+                                    { juce::AlertWindow::showMessageBoxAsync(
+                                          juce::AlertWindow::WarningIcon, TR("error.missing_model"),
+                                          modelName + " " + TR("error.model_not_found_at") + "\n" +
+                                              path.getFullPathName() + "\n\n" +
+                                              TR("error.install_models")); });
+  };
+  auto showModelLoadFailedAndAbort = [](const juce::String &modelName,
+                                        const juce::File &path)
+  {
+    juce::MessageManager::callAsync([modelName, path]()
+                                    { juce::AlertWindow::showMessageBoxAsync(
+                                          juce::AlertWindow::WarningIcon, TR("error.model_load_failed"),
+                                          modelName + " " + TR("error.model_exists_but_failed") + "\n" +
+                                              path.getFullPathName() + "\n\n" +
+                                              TR("error.check_device_settings")); });
+  };
+
+  // Extract F0
+  const float *samples = audioData.waveform.getReadPointer(0);
+  int numSamples = audioData.waveform.getNumSamples();
+
+  onProgress(0.175, TR("progress.mel_spectrogram"));
+  MelSpectrogram melComputer(audioData.sampleRate, N_FFT, HOP_SIZE, NUM_MELS,
+                             FMIN, FMAX);
+  audioData.melSpectrogram = melComputer.compute(samples, numSamples);
+
+  if (shuttingDown.load())
+    return;
+
+  int targetFrames = static_cast<int>(audioData.melSpectrogram.size());
+
+  onProgress(0.275, "Extracting pitch (F0)...");
+
+  if (pitchDetectorType == PitchDetectorType::RMVPE)
+  {
+    if (!rmvpeModelPath.existsAsFile())
+    {
+      showMissingModelAndAbort("rmvpe.onnx", rmvpeModelPath);
+      return;
+    }
+    if (!rmvpePitchDetector || !rmvpePitchDetector->isLoaded())
+    {
+      showModelLoadFailedAndAbort("rmvpe.onnx", rmvpeModelPath);
+      return;
+    }
+  }
+  else if (pitchDetectorType == PitchDetectorType::FCPE)
+  {
+    if (!fcpeModelPath.existsAsFile())
+    {
+      showMissingModelAndAbort("fcpe.onnx", fcpeModelPath);
+      return;
+    }
+    if (!fcpePitchDetector || !fcpePitchDetector->isLoaded())
+    {
+      showModelLoadFailedAndAbort("fcpe.onnx", fcpeModelPath);
+      return;
+    }
+    if (!melFilterbankPath.existsAsFile())
+    {
+      showMissingModelAndAbort("mel_filterbank.bin", melFilterbankPath);
+      return;
+    }
+    if (!centTablePath.existsAsFile())
+    {
+      showMissingModelAndAbort("cent_table.bin", centTablePath);
+      return;
+    }
+  }
+
+  LOG("========== PITCH DETECTOR SELECTION ==========");
+  LOG("Selected detector: " +
+      juce::String(pitchDetectorTypeToString(pitchDetectorType)));
+  LOG("RMVPE loaded: " +
+      juce::String(
+          rmvpePitchDetector && rmvpePitchDetector->isLoaded() ? "YES" : "NO"));
+  LOG("FCPE loaded: " +
+      juce::String(fcpePitchDetector && fcpePitchDetector->isLoaded() ? "YES"
+                                                                      : "NO"));
+
+  std::vector<float> extractedF0;
+  juce::String pitchInferenceError;
+  if (pitchDetectorType == PitchDetectorType::RMVPE)
+  {
+    extractedF0 = rmvpePitchDetector->extractF0(samples, numSamples,
+                                                audioData.sampleRate);
+    pitchInferenceError = rmvpePitchDetector->getLastError();
+  }
+  else if (pitchDetectorType == PitchDetectorType::FCPE)
+  {
+    extractedF0 =
+        fcpePitchDetector->extractF0(samples, numSamples, audioData.sampleRate);
+    pitchInferenceError = fcpePitchDetector->getLastError();
+  }
+
+  if (shuttingDown.load())
+    return;
+
+  // A DirectML session can be created successfully even when its adapter or
+  // driver later rejects a graph during Run(). Retry with a fresh CPU session
+  // so systems without a usable GPU do not fail with a misleading model-file
+  // error. Keep the successful CPU detector for subsequent analyses.
+  if (extractedF0.empty() &&
+      getProviderFromDevice(device) == GPUProvider::DirectML)
+  {
+    const auto detectorName =
+        juce::String(pitchDetectorTypeToString(pitchDetectorType));
+    LOG(detectorName + " DirectML inference failed: " +
+        (pitchInferenceError.isNotEmpty() ? pitchInferenceError
+                                           : "unknown error") +
+        "; retrying with CPU");
+
+    juce::String cpuRetryError;
+    if (pitchDetectorType == PitchDetectorType::RMVPE)
+    {
+      auto cpuDetector = std::make_unique<RMVPEPitchDetector>();
+      if (cpuDetector->loadModel(rmvpeModelPath, GPUProvider::CPU, 0))
+      {
+        auto cpuF0 = cpuDetector->extractF0(samples, numSamples,
+                                            audioData.sampleRate);
+        cpuRetryError = cpuDetector->getLastError();
+        if (!cpuF0.empty())
+        {
+          extractedF0 = std::move(cpuF0);
+          rmvpePitchDetector = std::move(cpuDetector);
+        }
+      }
+      else
+      {
+        cpuRetryError = cpuDetector->getLastError();
+      }
+    }
+    else if (pitchDetectorType == PitchDetectorType::FCPE)
+    {
+      auto cpuDetector = std::make_unique<FCPEPitchDetector>();
+      if (cpuDetector->loadModel(fcpeModelPath, melFilterbankPath,
+                                 centTablePath, GPUProvider::CPU, 0))
+      {
+        auto cpuF0 = cpuDetector->extractF0(samples, numSamples,
+                                            audioData.sampleRate);
+        cpuRetryError = cpuDetector->getLastError();
+        if (!cpuF0.empty())
+        {
+          extractedF0 = std::move(cpuF0);
+          fcpePitchDetector = std::move(cpuDetector);
+        }
+      }
+      else
+      {
+        cpuRetryError = cpuDetector->getLastError();
+      }
+    }
+
+    if (!extractedF0.empty())
+    {
+      LOG(detectorName +
+          " CPU retry succeeded; using CPU for subsequent inference");
+      device = "CPU";
+      deviceId = 0;
+      if (vocoder)
+      {
+        vocoder->setExecutionDevice("CPU");
+        vocoder->setExecutionDeviceId(0);
+        if (vocoder->isLoaded() && !vocoder->reloadModel())
+          LOG("Vocoder failed to reload after DirectML-to-CPU fallback");
+      }
+
+      // Move the synthesis engine at the same moment. On the CPU provider a
+      // vocoder render costs orders of magnitude more than PSOLA, which runs
+      // no model and no FFT at all, so leaving the engine behind just makes
+      // the user's next edit the slow one. Only reached through the DirectML
+      // fallback, which exists on Windows alone - the Core ML path never gets
+      // here and keeps the vocoder.
+      if (synthesisEngineType == SynthesisEngineType::Vocoder)
+      {
+        setSynthesisEngineType(SynthesisEngineType::Psola);
+        LOG("Synthesis engine switched to PSOLA for CPU inference");
+      }
+
+      // GAME will run later in this analysis. Give it a fresh CPU session as
+      // well, but keep the existing detector if the optional reload fails.
+      if (gameModelDir.isDirectory())
+      {
+        auto cpuGameDetector = std::make_unique<GAMEDetector>();
+        if (cpuGameDetector->loadModels(gameModelDir, GPUProvider::CPU, 0))
+          gameDetector = std::move(cpuGameDetector);
+        else
+          LOG("GAME failed to reload after DirectML-to-CPU fallback");
+      }
+    }
+    else
+    {
+      LOG(detectorName + " CPU retry failed: " +
+          (cpuRetryError.isNotEmpty() ? cpuRetryError : "unknown error"));
+      if (cpuRetryError.isNotEmpty())
+        pitchInferenceError +=
+            "\n\n" + TR("error.cpu_retry_failed") + "\n" + cpuRetryError;
+    }
+  }
+
+  if (shuttingDown.load())
+    return;
+
+  if (extractedF0.empty() || targetFrames <= 0)
+  {
+    const auto detail = pitchInferenceError.isNotEmpty()
+                            ? "\n\n" + TR("error.details") + "\n" +
+                                  pitchInferenceError.substring(0, 1000)
+                            : juce::String();
+    juce::MessageManager::callAsync([detail]()
+                                    { juce::AlertWindow::showMessageBoxAsync(
+                                          juce::AlertWindow::WarningIcon, TR("error.inference_failed"),
+                                          TR("error.f0_extraction_failed") + detail); });
+    return;
+  }
+
+  {
+    audioData.rawF0.assign(static_cast<size_t>(targetFrames), 0.0f);
+    audioData.voicedMask.assign(static_cast<size_t>(targetFrames), false);
+
+    const double neuralFrameTime = 160.0 / 16000.0;
+    const double vocoderFrameTime =
+        static_cast<double>(HOP_SIZE) /
+        static_cast<double>(std::max(1, audioData.sampleRate));
+    const int sourceFrameCount = static_cast<int>(extractedF0.size());
+
+    for (int i = 0; i < targetFrames; ++i)
+    {
+      const double vocoderTime = i * vocoderFrameTime;
+      const double neuralFramePos = vocoderTime / neuralFrameTime;
+      const int leftIdx = std::clamp(static_cast<int>(std::floor(neuralFramePos)),
+                                     0, sourceFrameCount - 1);
+      const int rightIdx = std::min(leftIdx + 1, sourceFrameCount - 1);
+      const int nearestIdx = std::clamp(
+          static_cast<int>(std::llround(neuralFramePos)), 0,
+          sourceFrameCount - 1);
+      const double frac =
+          std::clamp(neuralFramePos - std::floor(neuralFramePos), 0.0, 1.0);
+
+      // Resample the detector's U/V decision independently from pitch. This
+      // prevents a nearby positive F0 from turning an originally unvoiced
+      // target frame into a voiced one.
+      const bool isVoiced = extractedF0[static_cast<size_t>(nearestIdx)] > 0.0f;
+      audioData.voicedMask[static_cast<size_t>(i)] = isVoiced;
+      if (!isVoiced)
+        continue;
+
+      const float leftF0 = extractedF0[static_cast<size_t>(leftIdx)];
+      const float rightF0 = extractedF0[static_cast<size_t>(rightIdx)];
+      if (leftF0 > 0.0f && rightF0 > 0.0f && leftIdx != rightIdx)
+      {
+        const float logF0 = static_cast<float>(
+            std::log(leftF0) * (1.0 - frac) + std::log(rightF0) * frac);
+        audioData.rawF0[static_cast<size_t>(i)] = std::exp(logF0);
+      }
+      else
+      {
+        audioData.rawF0[static_cast<size_t>(i)] =
+            extractedF0[static_cast<size_t>(nearestIdx)];
+      }
+    }
+
+    // Compute energy-based VAD mask (captures consonants)
+    {
+      constexpr float kVadThreshold = 0.008f;
+      const float *vadSamples = audioData.waveform.getReadPointer(0);
+      const int vadNumSamples = audioData.waveform.getNumSamples();
+      const int vadNumFrames = static_cast<int>(audioData.rawF0.size());
+      audioData.vadMask.resize(vadNumFrames);
+      for (int vi = 0; vi < vadNumFrames; ++vi)
+      {
+        int ss = vi * HOP_SIZE;
+        int se = std::min(ss + HOP_SIZE, vadNumSamples);
+        if (ss >= vadNumSamples)
+        {
+          audioData.vadMask[vi] = false;
+          continue;
+        }
+        float sumSq = 0.0f;
+        for (int vj = ss; vj < se; ++vj)
+          sumSq += vadSamples[vj] * vadSamples[vj];
+        float rms = std::sqrt(sumSq / static_cast<float>(se - ss));
+        audioData.vadMask[vi] = rms > kVadThreshold;
+      }
+    }
+
+    onProgress(0.325, TR("progress.preparing_pitch"));
+    audioData.cleanedF0 =
+        F0Smoother::removeOutliers(audioData.rawF0, 1.5f);
+    audioData.denseF0 = PitchCurveProcessor::interpolateWithUvMask(
+        audioData.cleanedF0, audioData.voicedMask);
+    audioData.f0 = audioData.denseF0;
+  }
+
+  if (shuttingDown.load())
+    return;
+
+  onProgress(0.375, TR("progress.loading_vocoder"));
+  auto modelPath = PlatformPaths::getVocoderModelFile();
+
+  if (!modelPath.exists() && !vocoder->isLoaded())
+  {
+    showMissingModelAndAbort(TR("error.vocoder_model_name"), modelPath);
+    return;
+  }
+
+  if (modelPath.exists() && !vocoder->isLoaded())
+  {
+    if (vocoder->loadModel(modelPath))
+    {
+    }
+    else
+    {
+      juce::MessageManager::callAsync([modelPath]()
+                                      { juce::AlertWindow::showMessageBoxAsync(
+                                            juce::AlertWindow::WarningIcon, TR("error.inference_failed"),
+                                            TR("error.vocoder_load_failed") + "\n" +
+                                                modelPath.getFullPathName() + "\n\n" +
+                                                TR("error.check_model_install")); });
+      return;
+    }
+  }
+
+  if (shuttingDown.load())
+    return;
+
+  onProgress(0.50, TR("progress.detecting_notes"));
+  segmentIntoNotes(targetProject, nullptr, [&](double progress)
+                   { onProgress(0.50 + juce::jlimit(0.0, 1.0, progress) * 0.50,
+                                TR("progress.detecting_notes")); });
+
+  if (shuttingDown.load())
+    return;
+
+  PitchCurveProcessor::rebuildCurvesFromSource(targetProject, audioData.f0);
+  ScaleUtils::detectAndApplyScale(targetProject);
+
+  if (onComplete)
+    onComplete();
+}
+
+void EditorController::analyzeAudioAsync(
+    const std::function<void(Project &)> &onProjectReady,
+    const std::function<void()> &onProjectChanged)
+{
+  if (loaderThread.joinable())
+    loaderThread.join();
+
+  loaderThread = std::thread([this, onProjectReady, onProjectChanged]()
+                             {
+    if (!project)
+      return;
+
+    auto projectCopy = std::make_shared<Project>(*project);
+
+    analyzeAudio(*projectCopy, [](double, const juce::String &) {});
+    if (shuttingDown.load())
+      return;
+
+    juce::MessageManager::callAsync([this, projectCopy, onProjectReady,
+                                     onProjectChanged]() {
+      if (!project)
+        return;
+
+      project->getAudioData().melSpectrogram =
+          projectCopy->getAudioData().melSpectrogram;
+      project->getAudioData().rawF0 = projectCopy->getAudioData().rawF0;
+      project->getAudioData().cleanedF0 =
+          projectCopy->getAudioData().cleanedF0;
+      project->getAudioData().denseF0 = projectCopy->getAudioData().denseF0;
+      project->getAudioData().f0 = projectCopy->getAudioData().f0;
+      project->getAudioData().voicedMask =
+          projectCopy->getAudioData().voicedMask;
+      project->getAudioData().vadMask =
+          projectCopy->getAudioData().vadMask;
+      project->getAudioData().originalWaveform.makeCopyOf(
+          projectCopy->getAudioData().originalWaveform);
+      project->getAudioData().basePitch =
+          projectCopy->getAudioData().basePitch;
+      project->getAudioData().deltaPitch =
+          projectCopy->getAudioData().deltaPitch;
+      if (onProjectReady)
+        onProjectReady(*project);
+      if (onProjectChanged)
+        onProjectChanged();
+    }); });
+}
+
+void EditorController::segmentIntoNotesAsync(
+    const std::function<void(Project &)> &onProjectReady,
+    const std::function<void()> &onNotesChanged)
+{
+  if (loaderThread.joinable())
+    loaderThread.join();
+
+  loaderThread = std::thread([this, onProjectReady, onNotesChanged]()
+                             {
+    if (!project)
+      return;
+
+    auto projectCopy = std::make_shared<Project>(*project);
+    segmentIntoNotes(*projectCopy);
+
+    juce::MessageManager::callAsync([this, projectCopy, onProjectReady,
+                                     onNotesChanged]() {
+      if (!project)
+        return;
+
+      project->getNotes() = projectCopy->getNotes();
+
+      if (onProjectReady)
+        onProjectReady(*project);
+      if (onNotesChanged)
+        onNotesChanged();
+    }); });
+}
+
+void EditorController::segmentIntoNotes(Project &targetProject,
+                                        std::function<void()> onStreamingUpdate,
+                                        std::function<void(double)> onProgress)
+{
+  auto &audioData = targetProject.getAudioData();
+  auto &notes = targetProject.getNotes();
+  notes.clear();
+  audioData.segmentChunkRanges.clear();
+  audioData.segmentDebugChunks.clear();
+
+  if (audioData.f0.empty())
+    return;
+
+  if (!gameDetector || !gameDetector->isLoaded())
+  {
+    auto searchedPath = gameModelDir.getFullPathName();
+    auto bundlePath = PlatformPaths::getModelsDirectory().getChildFile("GAME").getFullPathName();
+
+    juce::String detail = TR("error.game_models_missing") + "\n\n"
+                                                            "Searched path: " +
+                          searchedPath + "\n"
+                                         "Bundle path: " +
+                          bundlePath + "\n"
+                                       "gameDetector: " +
+                          juce::String(gameDetector ? "created" : "null") + "\n"
+                                                                            "isLoaded: " +
+                          juce::String(gameDetector ? (gameDetector->isLoaded() ? "true" : "false") : "N/A") + "\n"
+                                                                                                               "isDirectory: " +
+                          juce::String(gameModelDir.isDirectory() ? "true" : "false") + "\n\n"
+                                                                                        "Required files: encoder.onnx, segmenter.onnx, estimator.onnx, bd2dur.onnx, config.json\n\n";
+
+    // List which files exist / missing
+    for (auto *name : {"encoder.onnx", "segmenter.onnx", "estimator.onnx", "bd2dur.onnx", "config.json"})
+    {
+      auto f = gameModelDir.getChildFile(name);
+      detail += juce::String(name) + ": " + (f.existsAsFile() ? "OK" : "MISSING") + "\n";
+    }
+
+    juce::MessageManager::callAsync([detail]()
+                                    { juce::AlertWindow::showMessageBoxAsync(
+                                          juce::AlertWindow::WarningIcon, TR("error.game_error"), detail); });
+    return;
+  }
+
+  if (gameDetector && gameDetector->isLoaded() &&
+      audioData.waveform.getNumSamples() > 0)
+  {
+
+    const float *samples = audioData.waveform.getReadPointer(0);
+    int numSamples = audioData.waveform.getNumSamples();
+    const int f0Size = static_cast<int>(audioData.f0.size());
+
+    auto gameNotes = gameDetector->detectNotesWithProgress(
+        samples, numSamples, GAMEDetector::SAMPLE_RATE, std::move(onProgress));
+
+    // Build debug chunks from actual GAME slicer chunk ranges
+    {
+      const auto &slicerChunks = gameDetector->getLastChunkRanges();
+      for (int ci = 0; ci < static_cast<int>(slicerChunks.size()); ++ci)
+      {
+        const auto &sc = slicerChunks[ci];
+        int chunkStartFrame = sc.startSample / GAMEDetector::HOP_SIZE;
+        int chunkEndFrame = (sc.endSample + GAMEDetector::HOP_SIZE - 1) / GAMEDetector::HOP_SIZE;
+        chunkStartFrame = std::max(0, std::min(chunkStartFrame, f0Size));
+        chunkEndFrame = std::max(chunkStartFrame, std::min(chunkEndFrame, f0Size));
+
+        audioData.segmentChunkRanges.emplace_back(chunkStartFrame, chunkEndFrame);
+
+        AudioData::SegmentDebugChunk dbgChunk;
+        dbgChunk.chunkIndex = ci;
+        dbgChunk.startFrame = chunkStartFrame;
+        dbgChunk.endFrame = chunkEndFrame;
+        dbgChunk.shortRestThreshold = 0;
+
+        for (const auto &gameNote : gameNotes)
+        {
+          if (gameNote.startFrame < chunkStartFrame || gameNote.startFrame >= chunkEndFrame)
+            continue;
+          AudioData::SegmentDebugEvent ev;
+          ev.startFrame = gameNote.startFrame;
+          ev.endFrame = gameNote.endFrame;
+          ev.attachedStartFrame = gameNote.startFrame;
+          ev.midiNote = gameNote.midiNote;
+          ev.isRest = gameNote.isRest;
+          ev.durationSeconds = static_cast<float>(gameNote.endFrame - gameNote.startFrame) *
+                               GAMEDetector::HOP_SIZE / static_cast<float>(GAMEDetector::SAMPLE_RATE);
+          ev.durationFrames = gameNote.endFrame - gameNote.startFrame;
+          dbgChunk.events.push_back(ev);
+        }
+        audioData.segmentDebugChunks.push_back(std::move(dbgChunk));
+      }
+
+      // Fallback: if no chunks (shouldn't happen), use full range
+      if (audioData.segmentChunkRanges.empty())
+        audioData.segmentChunkRanges.emplace_back(0, f0Size);
+    }
+
+    for (const auto &gameNote : gameNotes)
+    {
+      if (gameNote.isRest)
+        continue;
+
+      int f0Start = gameNote.startFrame;
+      int f0End = gameNote.endFrame;
+
+      f0Start = std::max(0, std::min(f0Start, f0Size - 1));
+      f0End = std::max(f0Start + 1, std::min(f0End, f0Size));
+
+      if (f0End - f0Start < 3)
+        continue;
+
+      Note note(f0Start, f0End, gameNote.midiNote);
+      std::vector<float> f0Values(audioData.f0.begin() + f0Start,
+                                  audioData.f0.begin() + f0End);
+      note.setF0Values(std::move(f0Values));
+      notes.push_back(note);
+    }
+
+    if (onStreamingUpdate)
+    {
+      juce::MessageManager::callAsync(onStreamingUpdate);
+    }
+
+    // VAD + GAME rest-guided boundary refinement:
+    // expand note heads/tails into energetic consonant regions so note lengths
+    // better cover pre/post-consonants.
+    if (!notes.empty() && !audioData.vadMask.empty())
+    {
+      struct RestRange
+      {
+        int start = 0;
+        int end = 0;
+      };
+      std::vector<RestRange> rests;
+      for (const auto &chunk : audioData.segmentDebugChunks)
+      {
+        for (const auto &ev : chunk.events)
+        {
+          if (!ev.isRest)
+            continue;
+          if (ev.endFrame <= ev.startFrame)
+            continue;
+          rests.push_back({ev.startFrame, ev.endFrame});
+        }
+      }
+
+      auto vadRatioInRange = [&](int s, int e) -> float
+      {
+        if (e <= s || audioData.vadMask.empty())
+          return 0.0f;
+        s = std::max(0, s);
+        e = std::min(e, static_cast<int>(audioData.vadMask.size()));
+        if (e <= s)
+          return 0.0f;
+        int voiced = 0;
+        for (int i = s; i < e; ++i)
+        {
+          if (audioData.vadMask[static_cast<size_t>(i)])
+            ++voiced;
+        }
+        return static_cast<float>(voiced) / static_cast<float>(e - s);
+      };
+
+      constexpr int kMaxHeadFrames = 14;       // ~162ms
+      constexpr int kMaxTailFrames = 10;       // ~116ms
+      constexpr int kRestBridgeGap = 4;        // allow tiny gap
+      constexpr int kMaxRestAttach = 18;       // max attached rest length
+      constexpr float kVadAttachRatio = 0.30f; // energetic enough to attach
+
+      const int f0Size = static_cast<int>(audioData.f0.size());
+
+      for (size_t ni = 0; ni < notes.size(); ++ni)
+      {
+        auto &note = notes[ni];
+        int start = note.getStartFrame();
+        int end = note.getEndFrame();
+        if (end <= start)
+          continue;
+
+        int prevEnd = 0;
+        if (ni > 0)
+          prevEnd = notes[ni - 1].getEndFrame();
+        int nextStart = static_cast<int>(audioData.vadMask.size());
+        if (ni + 1 < notes.size())
+          nextStart = notes[ni + 1].getStartFrame();
+
+        // 1) Plain VAD backward/forward expansion.
+        int newStart = start;
+        for (int i = start - 1; i >= std::max(prevEnd, start - kMaxHeadFrames);
+             --i)
+        {
+          if (i >= 0 && i < static_cast<int>(audioData.vadMask.size()) &&
+              audioData.vadMask[static_cast<size_t>(i)])
+            newStart = i;
+          else
+            break;
+        }
+
+        int newEnd = end;
+        for (int i = end; i < std::min(nextStart, end + kMaxTailFrames); ++i)
+        {
+          if (i >= 0 && i < static_cast<int>(audioData.vadMask.size()) &&
+              audioData.vadMask[static_cast<size_t>(i)])
+            newEnd = i + 1;
+          else
+            break;
+        }
+
+        // 2) Rest-guided attach (front/back) gated by VAD ratio.
+        for (const auto &rr : rests)
+        {
+          const int restLen = rr.end - rr.start;
+          if (restLen <= 0 || restLen > kMaxRestAttach)
+            continue;
+
+          // Front rest -> note head
+          if (rr.end <= start && start - rr.end <= kRestBridgeGap)
+          {
+            const int candStart = std::max(prevEnd, rr.start);
+            if (candStart < newStart &&
+                vadRatioInRange(candStart, start) >= kVadAttachRatio)
+            {
+              newStart = std::max(candStart, start - kMaxHeadFrames);
+            }
+          }
+
+          // Back rest -> note tail
+          if (rr.start >= end && rr.start - end <= kRestBridgeGap)
+          {
+            const int candEnd = std::min(nextStart, rr.end);
+            if (candEnd > newEnd &&
+                vadRatioInRange(end, candEnd) >= kVadAttachRatio)
+            {
+              newEnd = std::min(candEnd, end + kMaxTailFrames);
+            }
+          }
+        }
+
+        newStart = std::max(prevEnd, newStart);
+        newEnd = std::max(newStart + 1, std::min(nextStart, newEnd));
+        newStart = std::max(0, std::min(newStart, f0Size - 1));
+        newEnd = std::max(newStart + 1, std::min(newEnd, f0Size));
+
+        note.setStartFrame(newStart);
+        note.setEndFrame(newEnd);
+        note.setSrcStartFrame(newStart);
+        note.setSrcEndFrame(newEnd);
+        std::vector<float> f0Values(audioData.f0.begin() + newStart,
+                                    audioData.f0.begin() + newEnd);
+        note.setF0Values(std::move(f0Values));
+      }
+    }
+
+    for (auto& note : notes)
+      NoteAmplitude::update(note, audioData);
+
+    juce::Thread::sleep(100);
+
+    if (!audioData.f0.empty())
+      PitchCurveProcessor::rebuildCurvesFromSource(targetProject, audioData.f0);
+
+    return;
+  }
+
+  auto finalizeNote = [&](int start, int end)
+  {
+    if (end - start < 5)
+      return;
+
+    float midiSum = 0.0f;
+    int midiCount = 0;
+    for (int j = start; j < end; ++j)
+    {
+      if (j < static_cast<int>(audioData.voicedMask.size()) &&
+          audioData.voicedMask[j] && audioData.f0[j] > 0)
+      {
+        midiSum += freqToMidi(audioData.f0[j]);
+        midiCount++;
+      }
+    }
+    if (midiCount == 0)
+      return;
+
+    float midi = midiSum / midiCount;
+
+    Note note(start, end, midi);
+    std::vector<float> f0Values(audioData.f0.begin() + start,
+                                audioData.f0.begin() + end);
+    note.setF0Values(std::move(f0Values));
+    notes.push_back(note);
+  };
+
+  constexpr float pitchSplitThreshold = 0.5f;
+  constexpr int minFramesForSplit = 3;
+  constexpr int maxUnvoicedGap = INT_MAX;
+
+  bool inNote = false;
+  int noteStart = 0;
+  int currentMidiNote = 0;
+  int pitchChangeCount = 0;
+  int pitchChangeStart = 0;
+  int unvoicedCount = 0;
+
+  for (size_t i = 0; i < audioData.f0.size(); ++i)
+  {
+    bool voiced = i < audioData.voicedMask.size() && audioData.voicedMask[i];
+
+    if (voiced && !inNote)
+    {
+      inNote = true;
+      noteStart = static_cast<int>(i);
+      currentMidiNote =
+          static_cast<int>(std::round(freqToMidi(audioData.f0[i])));
+      pitchChangeCount = 0;
+      unvoicedCount = 0;
+    }
+    else if (voiced && inNote)
+    {
+      unvoicedCount = 0;
+
+      float currentMidi = freqToMidi(audioData.f0[i]);
+      int quantizedMidi = static_cast<int>(std::round(currentMidi));
+
+      if (quantizedMidi != currentMidiNote &&
+          std::abs(currentMidi - currentMidiNote) > pitchSplitThreshold)
+      {
+        if (pitchChangeCount == 0)
+          pitchChangeStart = static_cast<int>(i);
+        pitchChangeCount++;
+
+        if (pitchChangeCount >= minFramesForSplit)
+        {
+          finalizeNote(noteStart, pitchChangeStart);
+
+          noteStart = pitchChangeStart;
+          currentMidiNote = quantizedMidi;
+          pitchChangeCount = 0;
+        }
+      }
+      else
+      {
+        pitchChangeCount = 0;
+      }
+    }
+    else if (!voiced && inNote)
+    {
+      unvoicedCount++;
+      if (unvoicedCount > maxUnvoicedGap)
+      {
+        finalizeNote(noteStart, static_cast<int>(i) - unvoicedCount);
+        inNote = false;
+        pitchChangeCount = 0;
+        unvoicedCount = 0;
+      }
+    }
+  }
+
+  if (inNote)
+  {
+    finalizeNote(noteStart, static_cast<int>(audioData.f0.size()));
+  }
+
+  for (auto& note : notes)
+    NoteAmplitude::update(note, audioData);
+
+  if (!audioData.f0.empty())
+    PitchCurveProcessor::rebuildCurvesFromSource(targetProject, audioData.f0);
+}

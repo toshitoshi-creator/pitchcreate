@@ -1,0 +1,310 @@
+#include "SettingsManager.h"
+#include "../../Utils/AppLogger.h"
+#include "../GpuDeviceList.h"
+
+SettingsManager::SettingsManager()
+{
+  loadSettings();
+  loadConfig();
+}
+
+juce::File SettingsManager::getSettingsFile()
+{
+  return juce::File::getSpecialLocation(
+             juce::File::userApplicationDataDirectory)
+      .getChildFile("PitchNet")
+      .getChildFile("settings.xml");
+}
+
+juce::File SettingsManager::getConfigFile()
+{
+  return PlatformPaths::getConfigFile("config.json");
+}
+
+void SettingsManager::loadSettings()
+{
+  auto configFile = getConfigFile();
+  if (configFile.existsAsFile())
+    return;
+
+  auto settingsFile = getSettingsFile();
+  if (!settingsFile.existsAsFile())
+    return;
+
+  auto xml = juce::XmlDocument::parse(settingsFile);
+  if (xml == nullptr)
+    return;
+
+  if (xml->hasAttribute("device"))
+  {
+    device = xml->getStringAttribute("device", device);
+    hasStoredDeviceSetting = true;
+  }
+  threads = xml->getIntAttribute("threads", threads);
+
+  juce::String pitchDetectorStr = xml->getStringAttribute(
+      "pitchDetector", pitchDetectorTypeToString(pitchDetectorType));
+  pitchDetectorType = stringToPitchDetectorType(pitchDetectorStr);
+
+  juce::String synthesisEngineStr = xml->getStringAttribute(
+      "synthesisEngine", synthesisEngineTypeToString(synthesisEngineType));
+  synthesisEngineType = synthesisEngineTypeForSavedPreference(
+      stringToSynthesisEngineType(synthesisEngineStr));
+
+  if (xml->hasAttribute("gpuDeviceId"))
+  {
+    gpuDeviceId = xml->getIntAttribute("gpuDeviceId", gpuDeviceId);
+    hasStoredGpuDeviceIdSetting = true;
+  }
+  language = xml->getStringAttribute("language", language);
+
+  saveConfig();
+}
+
+int SettingsManager::getGPUDeviceId() const
+{
+  // Until the user picks a device, follow the provider's own default. Doing it
+  // here rather than at load time keeps it correct when the execution device
+  // changes, and keeps "unset" out of the config file.
+  if (hasStoredGpuDeviceIdSetting)
+    return gpuDeviceId;
+
+  return GpuDeviceList::getDefaultDeviceIndex(device);
+}
+
+void SettingsManager::applySettings()
+{
+  loadConfig();
+
+  if (vocoder)
+  {
+    vocoder->setExecutionDevice(device);
+    vocoder->setExecutionDeviceId(getGPUDeviceId());
+    if (vocoder->isLoaded())
+      vocoder->reloadModel();
+  }
+
+  if (onSettingsChanged)
+    onSettingsChanged();
+}
+
+void SettingsManager::loadConfig()
+{
+  auto configFile = getConfigFile();
+
+  if (configFile.existsAsFile())
+  {
+    auto configText = configFile.loadFileAsString();
+    auto config = juce::JSON::parse(configText);
+
+    if (config.isObject())
+    {
+      auto configObj = config.getDynamicObject();
+      if (configObj)
+      {
+        if (configObj->hasProperty("device"))
+        {
+          device = configObj->getProperty("device").toString();
+          hasStoredDeviceSetting = true;
+        }
+
+        if (configObj->hasProperty("threads"))
+          threads = static_cast<int>(configObj->getProperty("threads"));
+
+        if (configObj->hasProperty("pitchDetector"))
+        {
+          auto pitchDetectorStr =
+              configObj->getProperty("pitchDetector").toString();
+          pitchDetectorType = stringToPitchDetectorType(pitchDetectorStr);
+        }
+
+        if (configObj->hasProperty("synthesisEngine"))
+        {
+          auto synthesisEngineStr =
+              configObj->getProperty("synthesisEngine").toString();
+          synthesisEngineType = synthesisEngineTypeForSavedPreference(
+              stringToSynthesisEngineType(synthesisEngineStr));
+        }
+
+        if (configObj->hasProperty("gpuDeviceId"))
+        {
+          gpuDeviceId = static_cast<int>(configObj->getProperty("gpuDeviceId"));
+          hasStoredGpuDeviceIdSetting = true;
+        }
+
+        if (configObj->hasProperty("language"))
+          language = configObj->getProperty("language").toString();
+
+        if (auto *savedExport = configObj->getProperty("exportSettings").getDynamicObject())
+        {
+          ExportHelper::ExportSettings settings;
+          const auto format = savedExport->getProperty("format").toString();
+          if (format == "flac")
+            settings.format = ExportHelper::ExportFormat::flac;
+          else if (format == "aiff")
+            settings.format = ExportHelper::ExportFormat::aiff;
+          else if (format == "ogg")
+            settings.format = ExportHelper::ExportFormat::ogg;
+
+          const int sampleRate = static_cast<int>(savedExport->getProperty("sampleRate"));
+          if (sampleRate == 22050 || sampleRate == 32000 ||
+              sampleRate == 44100 || sampleRate == 48000)
+            settings.sampleRate = sampleRate;
+          const int bitDepth = static_cast<int>(savedExport->getProperty("bitDepth"));
+          if (bitDepth == 16 || bitDepth == 24 || bitDepth == 32)
+            settings.bitsPerSample = bitDepth;
+          const int channels = static_cast<int>(savedExport->getProperty("channels"));
+          if (channels == 1 || channels == 2)
+            settings.channels = channels;
+          exportSettings = settings;
+        }
+
+        auto lastFile = configObj->getProperty("lastFile").toString();
+        if (lastFile.isNotEmpty())
+          lastFilePath = juce::File(lastFile);
+
+        if (configObj->hasProperty("recentFiles"))
+        {
+          auto recentVar = configObj->getProperty("recentFiles");
+          if (recentVar.isArray())
+          {
+            recentFiles.clear();
+            for (int i = 0; i < recentVar.size(); ++i)
+            {
+              auto path = recentVar[i].toString();
+              if (path.isNotEmpty())
+                recentFiles.add(path);
+            }
+          }
+        }
+
+        if (configObj->hasProperty("windowWidth"))
+          windowWidth = static_cast<int>(configObj->getProperty("windowWidth"));
+        if (configObj->hasProperty("windowHeight"))
+          windowHeight =
+              static_cast<int>(configObj->getProperty("windowHeight"));
+        if (configObj->hasProperty("showDeltaPitch"))
+          showDeltaPitch =
+              static_cast<bool>(configObj->getProperty("showDeltaPitch"));
+        if (configObj->hasProperty("showBasePitch"))
+          showBasePitch =
+              static_cast<bool>(configObj->getProperty("showBasePitch"));
+        if (configObj->hasProperty("showSegmentsDebug"))
+          showSegmentsDebug =
+              static_cast<bool>(configObj->getProperty("showSegmentsDebug"));
+        if (configObj->hasProperty("showGameValuesDebug"))
+          showGameValuesDebug =
+              static_cast<bool>(configObj->getProperty("showGameValuesDebug"));
+        // Backward compatibility: read old key name
+        else if (configObj->hasProperty("showSomeValuesDebug"))
+          showGameValuesDebug =
+              static_cast<bool>(configObj->getProperty("showSomeValuesDebug"));
+        if (configObj->hasProperty("showNoteFramesDebug"))
+          showNoteFramesDebug =
+              static_cast<bool>(configObj->getProperty("showNoteFramesDebug"));
+        if (configObj->hasProperty("showUvInterpolationDebug"))
+          showUvInterpolationDebug =
+              static_cast<bool>(configObj->getProperty("showUvInterpolationDebug"));
+        if (configObj->hasProperty("showActualF0Debug"))
+          showActualF0Debug =
+              static_cast<bool>(configObj->getProperty("showActualF0Debug"));
+        if (configObj->hasProperty("showCleanedF0Debug"))
+          showCleanedF0Debug =
+              static_cast<bool>(configObj->getProperty("showCleanedF0Debug"));
+        if (configObj->hasProperty("showVocoderF0Debug"))
+          showVocoderF0Debug =
+              static_cast<bool>(configObj->getProperty("showVocoderF0Debug"));
+        if (configObj->hasProperty("followSystemAudioOutput"))
+          followSystemAudioOutput =
+              static_cast<bool>(configObj->getProperty("followSystemAudioOutput"));
+        if (configObj->hasProperty("preferredAudioOutputDevice"))
+          preferredAudioOutputDevice =
+              configObj->getProperty("preferredAudioOutputDevice").toString();
+        if (configObj->hasProperty("audioDeviceState"))
+          audioDeviceState =
+              configObj->getProperty("audioDeviceState").toString();
+        if (configObj->hasProperty("skippedUpdateVersion"))
+          skippedUpdateVersion =
+              configObj->getProperty("skippedUpdateVersion").toString();
+        if (configObj->hasProperty("uiBrightnessPercent"))
+          uiBrightnessPercent = juce::jlimit(
+              75.0, 200.0,
+              static_cast<double>(configObj->getProperty("uiBrightnessPercent")));
+        if (configObj->hasProperty("overviewVisible"))
+          overviewVisible =
+              static_cast<bool>(configObj->getProperty("overviewVisible"));
+        if (configObj->hasProperty("trackViewMode"))
+          trackViewMode =
+              static_cast<bool>(configObj->getProperty("trackViewMode"));
+        if (configObj->hasProperty("useDawTrackColour"))
+          useDawTrackColour =
+              static_cast<bool>(configObj->getProperty("useDawTrackColour"));
+        if (configObj->hasProperty("liveAuditionEnabled"))
+          liveAuditionEnabled =
+              static_cast<bool>(configObj->getProperty("liveAuditionEnabled"));
+      }
+    }
+  }
+}
+
+void SettingsManager::saveConfig()
+{
+  auto configFile = getConfigFile();
+
+  juce::DynamicObject::Ptr config = new juce::DynamicObject();
+
+  config->setProperty("device", device);
+  config->setProperty("threads", threads);
+  config->setProperty("pitchDetector",
+                      pitchDetectorTypeToString(pitchDetectorType));
+  config->setProperty("synthesisEngine",
+                      synthesisEngineTypeToString(synthesisEngineType));
+  if (hasStoredGpuDeviceIdSetting)
+    config->setProperty("gpuDeviceId", gpuDeviceId);
+  config->setProperty("language", language);
+
+  if (lastFilePath.existsAsFile())
+    config->setProperty("lastFile", lastFilePath.getFullPathName());
+
+  if (!recentFiles.isEmpty())
+  {
+    juce::Array<juce::var> recentArray;
+    for (const auto &path : recentFiles)
+      recentArray.add(path);
+    config->setProperty("recentFiles", recentArray);
+  }
+
+  config->setProperty("windowWidth", windowWidth);
+  config->setProperty("windowHeight", windowHeight);
+  config->setProperty("overviewVisible", overviewVisible);
+  config->setProperty("trackViewMode", trackViewMode);
+  config->setProperty("useDawTrackColour", useDawTrackColour);
+  config->setProperty("showDeltaPitch", showDeltaPitch);
+  config->setProperty("showBasePitch", showBasePitch);
+  config->setProperty("showSegmentsDebug", showSegmentsDebug);
+  config->setProperty("showGameValuesDebug", showGameValuesDebug);
+  config->setProperty("showNoteFramesDebug", showNoteFramesDebug);
+  config->setProperty("showUvInterpolationDebug", showUvInterpolationDebug);
+  config->setProperty("showActualF0Debug", showActualF0Debug);
+  config->setProperty("showCleanedF0Debug", showCleanedF0Debug);
+  config->setProperty("showVocoderF0Debug", showVocoderF0Debug);
+  config->setProperty("followSystemAudioOutput", followSystemAudioOutput);
+  config->setProperty("preferredAudioOutputDevice", preferredAudioOutputDevice);
+  config->setProperty("audioDeviceState", audioDeviceState);
+  config->setProperty("skippedUpdateVersion", skippedUpdateVersion);
+  config->setProperty("uiBrightnessPercent", uiBrightnessPercent);
+  config->setProperty("liveAuditionEnabled", liveAuditionEnabled);
+
+  if (exportSettings)
+  {
+    juce::DynamicObject::Ptr savedExport = new juce::DynamicObject();
+    savedExport->setProperty("format", ExportHelper::getFormatExtension(exportSettings->format));
+    savedExport->setProperty("sampleRate", exportSettings->sampleRate);
+    savedExport->setProperty("bitDepth", exportSettings->bitsPerSample);
+    savedExport->setProperty("channels", exportSettings->channels);
+    config->setProperty("exportSettings", juce::var(savedExport.get()));
+  }
+
+  juce::String jsonText = juce::JSON::toString(juce::var(config.get()));
+  configFile.replaceWithText(jsonText);
+}

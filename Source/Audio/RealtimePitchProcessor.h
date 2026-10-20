@@ -1,0 +1,81 @@
+#pragma once
+
+#include "../JuceHeader.h"
+#include "../Models/Project.h"
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <thread>
+
+/**
+ * Real-time playback of the edited waveform.
+ *
+ * Does no synthesis of its own. IncrementalSynthesizer commits its render into
+ * the project's composite waveform, and invalidate() snapshots that, resampling
+ * to the host rate when they differ. Keeping the synthesis in one place is what
+ * makes plugin playback agree with standalone, and with whichever engine
+ * produced the composite.
+ */
+class RealtimePitchProcessor {
+public:
+    RealtimePitchProcessor();
+    ~RealtimePitchProcessor();
+
+    void setProject(Project* proj);
+    void prepareToPlay(double sampleRate, int samplesPerBlock);
+
+    /**
+     * Process audio block
+     * @return true if processed audio was used, false if passthrough
+     */
+    bool processBlock(juce::AudioBuffer<float>& input,
+                      juce::AudioBuffer<float>& output,
+                      const juce::AudioPlayHead::PositionInfo* positionInfo);
+
+    /**
+     * Trigger re-computation (call when project data changes)
+     */
+    void invalidate();
+
+    // Lifecycle/message thread only; never call from processBlock().
+    // Complete pending SRC before the host can start an offline render.
+    void waitForPendingUpdate();
+
+    bool isReady() const { return ready.load(); }
+    double getPosition() const { return position.load(); }
+    void setPosition(double positionSeconds) { position.store(positionSeconds); }
+
+private:
+    /// Install a newly built cache. Keeps the outgoing buffer alive so
+    /// processBlock() can ramp between the two instead of cutting.
+    /// Caller must hold bufferLock.
+    void publishProcessedBuffer(juce::AudioBuffer<float>&& buffer);
+
+    Project* project = nullptr;
+    double sampleRate = 44100.0;
+
+    // Length of the ramp between an outgoing and an incoming cache. A
+    // resynthesis commit that lands mid-playback used to drop straight to the
+    // dry input until the new cache was built, which is an abrupt jump between
+    // two unrelated signals at both edges.
+    static constexpr int kBufferSwapFadeSamples = 512;
+
+    juce::AudioBuffer<float> processedBuffer;
+    juce::AudioBuffer<float> previousProcessedBuffer;
+    int swapFadeRemaining = 0;
+    std::atomic<bool> ready{false};
+    std::atomic<std::uint64_t> invalidateGeneration{0};
+    std::atomic<double> position{0.0};
+
+    // Continuous read cursor, touched only on the audio thread. Lets playback
+    // follow the host position contiguously and ignore sub-sample jitter in the
+    // host's reported time, which would otherwise cause boundary clicks.
+    juce::int64 readPosition = 0;
+    bool readPositionValid = false;
+
+    juce::CriticalSection bufferLock;
+    // Protect worker ownership when a host lifecycle call overlaps an editor
+    // cache update. Workers never acquire this lock, including while joining.
+    juce::CriticalSection computeThreadLock;
+    std::unique_ptr<std::thread> computeThread;
+};

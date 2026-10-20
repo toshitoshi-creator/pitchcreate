@@ -1,0 +1,1447 @@
+#include "SettingsComponent.h"
+#include "GpuDeviceList.h"
+#include "../Utils/Constants.h"
+#include "../Utils/UI/Theme.h"
+#include "../Utils/Localization.h"
+
+#ifdef HAVE_ONNXRUNTIME
+#include <onnxruntime_cxx_api.h>
+#endif
+
+namespace
+{
+  constexpr int kFollowSystemOutputId = 1;
+
+#if JUCE_DEBUG
+  constexpr bool kShowSettingsTabSelector = true;
+#else
+  constexpr bool kShowSettingsTabSelector = false;
+#endif
+
+  juce::String resolveDefaultOutputDeviceName(juce::AudioDeviceManager *deviceManager)
+  {
+    if (deviceManager == nullptr)
+      return {};
+
+    auto *currentType = deviceManager->getCurrentDeviceTypeObject();
+    if (currentType == nullptr)
+      return {};
+
+    auto devices = currentType->getDeviceNames(false);
+    const int defaultIndex = currentType->getDefaultDeviceIndex(false);
+    if (juce::isPositiveAndBelow(defaultIndex, devices.size()))
+      return devices[defaultIndex];
+
+    if (devices.size() > 0)
+      return devices[0];
+
+    return {};
+  }
+
+} // namespace
+
+//==============================================================================
+// SettingsComponent
+//==============================================================================
+
+SettingsComponent::SettingsComponent(
+    SettingsManager *settingsMgr, juce::AudioDeviceManager *audioDeviceManager)
+    : deviceManager(audioDeviceManager),
+      pluginMode(audioDeviceManager == nullptr), settingsManager(settingsMgr)
+{
+  // Allow transparent corners for rounded window styling
+  setOpaque(false);
+
+  auto configureRowLabel = [](juce::Label &label)
+  {
+    label.setColour(juce::Label::textColourId, APP_COLOR_TEXT_PRIMARY);
+    label.setFont(AppFont::getFont(15.0f));
+    label.setJustificationType(juce::Justification::centredLeft);
+  };
+
+  // Title
+  titleLabel.setText(TR("settings.title"), juce::dontSendNotification);
+  titleLabel.setFont(AppFont::getBoldFont(20.0f));
+  titleLabel.setColour(juce::Label::textColourId, APP_COLOR_TEXT_PRIMARY);
+  addAndMakeVisible(titleLabel);
+
+  auto configureTabButton = [this](juce::TextButton &button)
+  {
+    button.setClickingTogglesState(false);
+    button.setMouseCursor(juce::MouseCursor::PointingHandCursor);
+    button.setLookAndFeel(&settingsLookAndFeel);
+  };
+
+  // Tabs
+  generalTabButton.setButtonText(TR("settings.general"));
+  configureTabButton(generalTabButton);
+  generalTabButton.onClick = [this]()
+  { setActiveTab(SettingsTab::General); };
+  addAndMakeVisible(generalTabButton);
+
+  audioTabButton.setButtonText(TR("settings.audio"));
+  configureTabButton(audioTabButton);
+  audioTabButton.onClick = [this]()
+  { setActiveTab(SettingsTab::Audio); };
+  addAndMakeVisible(audioTabButton);
+
+  // Device selection
+  deviceLabel.setText(TR("settings.device"), juce::dontSendNotification);
+  configureRowLabel(deviceLabel);
+  addAndMakeVisible(deviceLabel);
+
+  deviceComboBox.addListener(this);
+  deviceComboBox.applyStyle();
+  addAndMakeVisible(deviceComboBox);
+
+  // GPU device ID selection
+  gpuDeviceLabel.setText(TR("settings.gpu_device"), juce::dontSendNotification);
+  configureRowLabel(gpuDeviceLabel);
+  addAndMakeVisible(gpuDeviceLabel);
+
+  // GPU device list will be populated dynamically based on available devices
+  gpuDeviceComboBox.addListener(this);
+  gpuDeviceComboBox.applyStyle();
+  addAndMakeVisible(gpuDeviceComboBox);
+  gpuDeviceLabel.setVisible(false);
+  gpuDeviceComboBox.setVisible(false);
+
+  // Pitch detector selection
+  pitchDetectorLabel.setText(TR("settings.pitch_detector"),
+                             juce::dontSendNotification);
+  configureRowLabel(pitchDetectorLabel);
+  addAndMakeVisible(pitchDetectorLabel);
+
+  pitchDetectorComboBox.addItem("RMVPE", 1);
+  pitchDetectorComboBox.addItem("FCPE", 2);
+  pitchDetectorComboBox.setSelectedId(
+      2, juce::dontSendNotification); // Default to FCPE
+  pitchDetectorComboBox.addListener(this);
+  pitchDetectorComboBox.applyStyle();
+  addAndMakeVisible(pitchDetectorComboBox);
+
+  gameChunksDebugLabel.setText(TR("settings.debug_game_chunks"),
+                               juce::dontSendNotification);
+  configureRowLabel(gameChunksDebugLabel);
+  addAndMakeVisible(gameChunksDebugLabel);
+
+  segmentsDebugToggle.setButtonText("");
+  segmentsDebugToggle.setClickingTogglesState(true);
+  segmentsDebugToggle.onClick = [this]()
+  {
+    showSegmentsDebug = segmentsDebugToggle.getToggleState();
+    if (settingsManager)
+    {
+      settingsManager->setShowSegmentsDebug(showSegmentsDebug);
+      settingsManager->saveConfig();
+    }
+    if (onShowSegmentsDebugChanged)
+      onShowSegmentsDebugChanged(showSegmentsDebug);
+  };
+  addAndMakeVisible(segmentsDebugToggle);
+
+  gameValuesDebugLabel.setText(TR("settings.debug_game_values"),
+                               juce::dontSendNotification);
+  configureRowLabel(gameValuesDebugLabel);
+  addAndMakeVisible(gameValuesDebugLabel);
+
+  gameValuesDebugToggle.setButtonText("");
+  gameValuesDebugToggle.setClickingTogglesState(true);
+  gameValuesDebugToggle.onClick = [this]()
+  {
+    showGameValuesDebug = gameValuesDebugToggle.getToggleState();
+    if (settingsManager)
+    {
+      settingsManager->setShowGameValuesDebug(showGameValuesDebug);
+      settingsManager->saveConfig();
+    }
+    if (onShowGameValuesDebugChanged)
+      onShowGameValuesDebugChanged(showGameValuesDebug);
+  };
+  addAndMakeVisible(gameValuesDebugToggle);
+
+  noteFramesDebugLabel.setText(TR("settings.debug_note_frames"),
+                               juce::dontSendNotification);
+  configureRowLabel(noteFramesDebugLabel);
+  addAndMakeVisible(noteFramesDebugLabel);
+
+  noteFramesDebugToggle.setButtonText("");
+  noteFramesDebugToggle.setClickingTogglesState(true);
+  noteFramesDebugToggle.onClick = [this]()
+  {
+    showNoteFramesDebug = noteFramesDebugToggle.getToggleState();
+    if (settingsManager)
+    {
+      settingsManager->setShowNoteFramesDebug(showNoteFramesDebug);
+      settingsManager->saveConfig();
+    }
+    if (onShowNoteFramesDebugChanged)
+      onShowNoteFramesDebugChanged(showNoteFramesDebug);
+  };
+  addAndMakeVisible(noteFramesDebugToggle);
+
+  uvInterpolationDebugLabel.setText(TR("settings.debug_uv_f0"),
+                                    juce::dontSendNotification);
+  configureRowLabel(uvInterpolationDebugLabel);
+  addAndMakeVisible(uvInterpolationDebugLabel);
+
+  uvInterpolationDebugToggle.setButtonText("");
+  uvInterpolationDebugToggle.setClickingTogglesState(true);
+  uvInterpolationDebugToggle.onClick = [this]()
+  {
+    showUvInterpolationDebug = uvInterpolationDebugToggle.getToggleState();
+    if (settingsManager)
+    {
+      settingsManager->setShowUvInterpolationDebug(showUvInterpolationDebug);
+      settingsManager->saveConfig();
+    }
+    if (onShowUvInterpolationDebugChanged)
+      onShowUvInterpolationDebugChanged(showUvInterpolationDebug);
+  };
+  addAndMakeVisible(uvInterpolationDebugToggle);
+
+  actualF0DebugLabel.setText(TR("settings.debug_raw_f0"),
+                             juce::dontSendNotification);
+  configureRowLabel(actualF0DebugLabel);
+  addAndMakeVisible(actualF0DebugLabel);
+
+  actualF0DebugToggle.setButtonText("");
+  actualF0DebugToggle.setClickingTogglesState(true);
+  actualF0DebugToggle.onClick = [this]()
+  {
+    showActualF0Debug = actualF0DebugToggle.getToggleState();
+    if (settingsManager)
+    {
+      settingsManager->setShowActualF0Debug(showActualF0Debug);
+      settingsManager->saveConfig();
+    }
+    if (onShowActualF0DebugChanged)
+      onShowActualF0DebugChanged(showActualF0Debug);
+  };
+  addAndMakeVisible(actualF0DebugToggle);
+
+  cleanedF0DebugLabel.setText(TR("settings.debug_cleaned_f0"),
+                              juce::dontSendNotification);
+  configureRowLabel(cleanedF0DebugLabel);
+  addAndMakeVisible(cleanedF0DebugLabel);
+
+  cleanedF0DebugToggle.setButtonText("");
+  cleanedF0DebugToggle.setClickingTogglesState(true);
+  cleanedF0DebugToggle.onClick = [this]()
+  {
+    showCleanedF0Debug = cleanedF0DebugToggle.getToggleState();
+    if (settingsManager)
+    {
+      settingsManager->setShowCleanedF0Debug(showCleanedF0Debug);
+      settingsManager->saveConfig();
+    }
+    if (onShowCleanedF0DebugChanged)
+      onShowCleanedF0DebugChanged(showCleanedF0Debug);
+  };
+  addAndMakeVisible(cleanedF0DebugToggle);
+
+  vocoderF0DebugLabel.setText(TR("settings.debug_vocoder_f0"),
+                              juce::dontSendNotification);
+  configureRowLabel(vocoderF0DebugLabel);
+  addAndMakeVisible(vocoderF0DebugLabel);
+
+  vocoderF0DebugToggle.setButtonText("");
+  vocoderF0DebugToggle.setClickingTogglesState(true);
+  vocoderF0DebugToggle.onClick = [this]()
+  {
+    showVocoderF0Debug = vocoderF0DebugToggle.getToggleState();
+    if (settingsManager)
+    {
+      settingsManager->setShowVocoderF0Debug(showVocoderF0Debug);
+      settingsManager->saveConfig();
+    }
+    if (onShowVocoderF0DebugChanged)
+      onShowVocoderF0DebugChanged(showVocoderF0Debug);
+  };
+  addAndMakeVisible(vocoderF0DebugToggle);
+
+  // Info label
+  infoLabel.setColour(juce::Label::textColourId, APP_COLOR_TEXT_MUTED);
+  infoLabel.setFont(AppFont::getFont(15.0f));
+  infoLabel.setJustificationType(juce::Justification::topLeft);
+  addAndMakeVisible(infoLabel);
+
+  // Audio device settings (standalone mode only)
+  if (!pluginMode && deviceManager != nullptr)
+  {
+    deviceManager->addChangeListener(this);
+    startTimerHz(1);
+
+    // Audio device type (driver)
+    audioDeviceTypeLabel.setText(TR("settings.audio_driver"),
+                                 juce::dontSendNotification);
+    configureRowLabel(audioDeviceTypeLabel);
+    addAndMakeVisible(audioDeviceTypeLabel);
+    audioDeviceTypeComboBox.addListener(this);
+    audioDeviceTypeComboBox.applyStyle();
+    addAndMakeVisible(audioDeviceTypeComboBox);
+
+    // Output device
+    audioOutputLabel.setText(TR("settings.audio_output"),
+                             juce::dontSendNotification);
+    configureRowLabel(audioOutputLabel);
+    addAndMakeVisible(audioOutputLabel);
+    audioOutputComboBox.addListener(this);
+    audioOutputComboBox.applyStyle();
+    addAndMakeVisible(audioOutputComboBox);
+
+    // Sample rate
+    sampleRateLabel.setText(TR("settings.sample_rate"),
+                            juce::dontSendNotification);
+    configureRowLabel(sampleRateLabel);
+    addAndMakeVisible(sampleRateLabel);
+    sampleRateComboBox.addListener(this);
+    sampleRateComboBox.applyStyle();
+    addAndMakeVisible(sampleRateComboBox);
+
+    // Buffer size
+    bufferSizeLabel.setText(TR("settings.buffer_size"),
+                            juce::dontSendNotification);
+    configureRowLabel(bufferSizeLabel);
+    addAndMakeVisible(bufferSizeLabel);
+    bufferSizeComboBox.addListener(this);
+    bufferSizeComboBox.applyStyle();
+    addAndMakeVisible(bufferSizeComboBox);
+
+    // Output channels
+    outputChannelsLabel.setText(TR("settings.output_channels"),
+                                juce::dontSendNotification);
+    configureRowLabel(outputChannelsLabel);
+    addAndMakeVisible(outputChannelsLabel);
+    outputChannelsComboBox.addItem(TR("settings.mono"), 1);
+    outputChannelsComboBox.addItem(TR("settings.stereo"), 2);
+    outputChannelsComboBox.setSelectedId(2, juce::dontSendNotification);
+    outputChannelsComboBox.addListener(this);
+    outputChannelsComboBox.applyStyle();
+    addAndMakeVisible(outputChannelsComboBox);
+
+    updateAudioDeviceTypes();
+  }
+
+  activeTab = pluginMode ? SettingsTab::General : SettingsTab::Audio;
+
+  // Load saved settings
+  loadSettings();
+  updateDeviceList();
+
+  updateTabButtonStyles();
+  updateTabVisibility();
+
+  // Set size based on mode
+  if (pluginMode)
+    setSize(720, 520);
+  else
+    setSize(820, 700);
+}
+
+SettingsComponent::~SettingsComponent()
+{
+  stopTimer();
+  if (!pluginMode && deviceManager != nullptr)
+    deviceManager->removeChangeListener(this);
+  generalTabButton.setLookAndFeel(nullptr);
+  audioTabButton.setLookAndFeel(nullptr);
+  deviceComboBox.setLookAndFeel(nullptr);
+  gpuDeviceComboBox.setLookAndFeel(nullptr);
+  pitchDetectorComboBox.setLookAndFeel(nullptr);
+  audioDeviceTypeComboBox.setLookAndFeel(nullptr);
+  audioOutputComboBox.setLookAndFeel(nullptr);
+  sampleRateComboBox.setLookAndFeel(nullptr);
+  bufferSizeComboBox.setLookAndFeel(nullptr);
+  outputChannelsComboBox.setLookAndFeel(nullptr);
+  segmentsDebugToggle.setLookAndFeel(nullptr);
+  gameValuesDebugToggle.setLookAndFeel(nullptr);
+  noteFramesDebugToggle.setLookAndFeel(nullptr);
+  uvInterpolationDebugToggle.setLookAndFeel(nullptr);
+  actualF0DebugToggle.setLookAndFeel(nullptr);
+  cleanedF0DebugToggle.setLookAndFeel(nullptr);
+  vocoderF0DebugToggle.setLookAndFeel(nullptr);
+}
+
+void SettingsComponent::changeListenerCallback(
+    juce::ChangeBroadcaster *source)
+{
+  if (source == deviceManager)
+  {
+    syncToSystemOutputIfNeeded();
+    updateAudioOutputDevices(true);
+    persistAudioDeviceSettings();
+  }
+}
+
+void SettingsComponent::timerCallback()
+{
+  if (!followSystemAudioOutput || pluginMode || deviceManager == nullptr)
+    return;
+  syncToSystemOutputIfNeeded();
+}
+
+void SettingsComponent::paint(juce::Graphics &g)
+{
+  juce::Path rounded;
+  rounded.addRoundedRectangle(getLocalBounds().toFloat(), cornerRadius);
+  g.reduceClipRegion(rounded);
+
+  // Flat background fill
+  g.setColour(juce::Colour(0xFF232323u));
+  g.fillRoundedRectangle(getLocalBounds().toFloat(), cornerRadius);
+
+  if (!sidebarBounds.isEmpty())
+  {
+    g.setColour(APP_COLOR_BORDER_SUBTLE);
+    g.drawLine((float)sidebarBounds.getRight(), (float)sidebarBounds.getY(),
+               (float)sidebarBounds.getRight(),
+               (float)sidebarBounds.getBottom(), 1.0f);
+  }
+
+  if (!tabListBounds.isEmpty())
+  {
+    auto tabCard = tabListBounds.toFloat();
+    g.setColour(juce::Colour(0xFF151515u));
+    g.fillRoundedRectangle(tabCard, 10.0f);
+    g.setColour(APP_COLOR_BORDER.withAlpha(0.55f));
+    g.drawRoundedRectangle(tabCard.reduced(0.5f), 10.0f, 0.75f);
+  }
+
+  if (!cardBounds.isEmpty())
+  {
+    auto card = cardBounds.toFloat();
+    g.setColour(juce::Colour(0xFF151515u));
+    g.fillRoundedRectangle(card, 8.0f);
+
+    g.setColour(APP_COLOR_BORDER.withAlpha(0.55f));
+    g.drawRoundedRectangle(card.reduced(0.5f), 8.0f, 0.75f);
+
+  }
+}
+
+void SettingsComponent::resized()
+{
+  auto bounds = getLocalBounds().reduced(16);
+  tabListBounds = {};
+
+  const int sidebarWidth = 140;
+  if (kShowSettingsTabSelector)
+  {
+    sidebarBounds = bounds.removeFromLeft(sidebarWidth);
+
+    auto tabAreaBounds = sidebarBounds.reduced(8, 10);
+    const int tabHeight = 32;
+    const int tabGap = 6;
+    const int tabCount = audioTabButton.isVisible() ? 2 : 1;
+    const int tabContainerHeight =
+        16 + tabCount * tabHeight + (tabCount - 1) * tabGap;
+    tabListBounds =
+        tabAreaBounds.withHeight(juce::jmin(tabAreaBounds.getHeight(), tabContainerHeight));
+
+    auto tabArea = tabListBounds.reduced(8, 8);
+    generalTabButton.setBounds(tabArea.removeFromTop(tabHeight));
+    if (audioTabButton.isVisible())
+    {
+      tabArea.removeFromTop(tabGap);
+      audioTabButton.setBounds(tabArea.removeFromTop(tabHeight));
+    }
+
+    bounds.removeFromLeft(10);
+  }
+  else
+  {
+    sidebarBounds = {};
+    tabListBounds = {};
+    generalTabButton.setBounds({});
+    audioTabButton.setBounds({});
+  }
+
+  auto titleArea = bounds.removeFromTop(34);
+  titleLabel.setBounds(titleArea);
+  bounds.removeFromTop(6);
+
+  cardBounds = bounds;
+  auto content = cardBounds.reduced(16, 12);
+
+  const int rowHeight = 32;
+  const int rowGap = 8;
+  const int controlWidth =
+      juce::jlimit(190, 300, content.getWidth() / 3);
+  const int labelWidth =
+      juce::jlimit(180, 320, content.getWidth() - controlWidth - 24);
+
+  auto layoutRow = [&](juce::Label &label, juce::Component &control)
+  {
+    auto row = content.removeFromTop(rowHeight);
+    auto labelArea = row.removeFromLeft(labelWidth);
+    auto controlArea = row.removeFromRight(controlWidth);
+    label.setBounds(labelArea);
+    control.setBounds(controlArea.reduced(0, 2));
+    content.removeFromTop(rowGap);
+  };
+
+  if (activeTab == SettingsTab::General)
+  {
+    layoutRow(deviceLabel, deviceComboBox);
+
+    if (gpuDeviceLabel.isVisible())
+    {
+      layoutRow(gpuDeviceLabel, gpuDeviceComboBox);
+    }
+
+    layoutRow(pitchDetectorLabel, pitchDetectorComboBox);
+    layoutRow(gameChunksDebugLabel, segmentsDebugToggle);
+    layoutRow(gameValuesDebugLabel, gameValuesDebugToggle);
+    layoutRow(noteFramesDebugLabel, noteFramesDebugToggle);
+    layoutRow(actualF0DebugLabel, actualF0DebugToggle);
+    layoutRow(cleanedF0DebugLabel, cleanedF0DebugToggle);
+    layoutRow(uvInterpolationDebugLabel, uvInterpolationDebugToggle);
+    layoutRow(vocoderF0DebugLabel, vocoderF0DebugToggle);
+
+    infoLabel.setBounds(content.removeFromTop(56));
+    content.removeFromTop(12);
+  }
+
+  if (!pluginMode && deviceManager != nullptr &&
+      activeTab == SettingsTab::Audio)
+  {
+    layoutRow(audioDeviceTypeLabel, audioDeviceTypeComboBox);
+    layoutRow(audioOutputLabel, audioOutputComboBox);
+    layoutRow(sampleRateLabel, sampleRateComboBox);
+    layoutRow(bufferSizeLabel, bufferSizeComboBox);
+    layoutRow(outputChannelsLabel, outputChannelsComboBox);
+  }
+}
+
+void SettingsComponent::comboBoxChanged(juce::ComboBox *comboBox)
+{
+  if (isRefreshingAudioControls &&
+      (comboBox == &audioDeviceTypeComboBox || comboBox == &audioOutputComboBox ||
+       comboBox == &sampleRateComboBox || comboBox == &bufferSizeComboBox ||
+       comboBox == &outputChannelsComboBox))
+    return;
+
+  if (comboBox == &deviceComboBox)
+  {
+    if (canChangeDevice && !canChangeDevice())
+    {
+      for (int i = 0; i < deviceComboBox.getNumItems(); ++i)
+      {
+        if (deviceComboBox.getItemText(i) == lastConfirmedDevice)
+        {
+          deviceComboBox.setSelectedItemIndex(i,
+                                              juce::dontSendNotification);
+          break;
+        }
+      }
+      currentDevice = lastConfirmedDevice;
+      updateGPUDeviceList(currentDevice);
+      gpuDeviceComboBox.setSelectedId(lastConfirmedGpuDeviceId + 1,
+                                      juce::dontSendNotification);
+      infoLabel.setText(TR("settings.device_locked"),
+                        juce::dontSendNotification);
+      updateTabVisibility();
+      resized();
+      return;
+    }
+
+    currentDevice = deviceComboBox.getText();
+
+    // Show/hide GPU device selector based on device type
+    bool showGpuDeviceList = shouldShowGpuDeviceList();
+    if (showGpuDeviceList)
+    {
+      // Update GPU device list for the selected device type
+      updateGPUDeviceList(currentDevice);
+    }
+    updateTabVisibility();
+    resized();
+
+    saveSettings();
+
+    // Update info label
+    if (currentDevice == "CPU")
+    {
+      infoLabel.setText(TR("settings.cpu_desc"), juce::dontSendNotification);
+    }
+    else if (currentDevice == "CUDA")
+    {
+      infoLabel.setText(TR("settings.cuda_desc"), juce::dontSendNotification);
+    }
+    else if (currentDevice == "DirectML")
+    {
+      infoLabel.setText(TR("settings.directml_desc"),
+                        juce::dontSendNotification);
+    }
+    else if (currentDevice == "CoreML")
+    {
+      infoLabel.setText(TR("settings.coreml_desc"), juce::dontSendNotification);
+    }
+
+    if (onSettingsChanged)
+      onSettingsChanged();
+
+    lastConfirmedDevice = currentDevice;
+    lastConfirmedGpuDeviceId = gpuDeviceId;
+  }
+  else if (comboBox == &gpuDeviceComboBox)
+  {
+    if (canChangeDevice && !canChangeDevice())
+    {
+      gpuDeviceComboBox.setSelectedId(lastConfirmedGpuDeviceId + 1,
+                                      juce::dontSendNotification);
+      infoLabel.setText(TR("settings.device_locked"),
+                        juce::dontSendNotification);
+      return;
+    }
+    gpuDeviceId = gpuDeviceComboBox.getSelectedId() - 1;
+    saveSettings();
+    if (onSettingsChanged)
+      onSettingsChanged();
+    lastConfirmedGpuDeviceId = gpuDeviceId;
+  }
+  else if (comboBox == &pitchDetectorComboBox)
+  {
+    int selectedId = pitchDetectorComboBox.getSelectedId();
+    if (selectedId == 1)
+      pitchDetectorType = PitchDetectorType::RMVPE;
+    else if (selectedId == 2)
+      pitchDetectorType = PitchDetectorType::FCPE;
+
+    saveSettings();
+
+    if (onPitchDetectorChanged)
+      onPitchDetectorChanged(pitchDetectorType);
+  }
+  else if (comboBox == &audioDeviceTypeComboBox)
+  {
+    int idx = audioDeviceTypeComboBox.getSelectedId() - 1;
+    if (idx >= 0 && idx < audioDeviceTypeOrder.size())
+    {
+      const auto targetType = audioDeviceTypeOrder.getReference(idx)->getTypeName();
+      const auto *currentType = deviceManager->getCurrentDeviceTypeObject();
+      if (currentType == nullptr || currentType->getTypeName() != targetType)
+        deviceManager->setCurrentAudioDeviceType(targetType, true);
+      updateAudioOutputDevices(true);
+      persistAudioDeviceSettings();
+    }
+  }
+  else if (comboBox == &audioOutputComboBox)
+  {
+    followSystemAudioOutput =
+        (audioOutputComboBox.getSelectedId() == kFollowSystemOutputId);
+    if (!followSystemAudioOutput && audioOutputComboBox.getSelectedId() > kFollowSystemOutputId)
+      preferredAudioOutputDevice = audioOutputComboBox.getText();
+    applyAudioSettings();
+  }
+  else if (comboBox == &sampleRateComboBox ||
+           comboBox == &bufferSizeComboBox ||
+           comboBox == &outputChannelsComboBox)
+  {
+    applyAudioSettings();
+  }
+}
+
+bool SettingsComponent::shouldShowGpuDeviceList() const
+{
+  return currentDevice == "CUDA" || currentDevice == "DirectML";
+}
+
+void SettingsComponent::setActiveTab(SettingsTab tab)
+{
+  if (activeTab == tab)
+    return;
+
+  activeTab = tab;
+
+  if (activeTab == SettingsTab::Audio && !pluginMode && deviceManager != nullptr)
+    updateAudioOutputDevices(true);
+
+  updateTabButtonStyles();
+  updateTabVisibility();
+  resized();
+  repaint();
+}
+
+void SettingsComponent::updateTabButtonStyles()
+{
+  auto applyStyle = [&](juce::TextButton &button, bool isActive)
+  {
+    const auto activeBg = APP_COLOR_PRIMARY.withAlpha(0.22f);
+    const auto inactiveBg = APP_COLOR_SURFACE_ALT.withAlpha(0.75f);
+    const auto activeText = APP_COLOR_TEXT_PRIMARY;
+    const auto inactiveText = APP_COLOR_TEXT_MUTED;
+
+    if (isActive)
+    {
+      button.setColour(juce::TextButton::buttonColourId, activeBg);
+      button.setColour(juce::TextButton::buttonOnColourId, activeBg);
+      button.setColour(juce::TextButton::textColourOffId, activeText);
+      button.setColour(juce::TextButton::textColourOnId, activeText);
+    }
+    else
+    {
+      button.setColour(juce::TextButton::buttonColourId, inactiveBg);
+      button.setColour(juce::TextButton::buttonOnColourId, inactiveBg);
+      button.setColour(juce::TextButton::textColourOffId, inactiveText);
+      button.setColour(juce::TextButton::textColourOnId, inactiveText);
+    }
+
+    button.getProperties().set("isActiveTab", isActive);
+  };
+
+  applyStyle(generalTabButton, activeTab == SettingsTab::General);
+  applyStyle(audioTabButton, activeTab == SettingsTab::Audio);
+}
+
+void SettingsComponent::updateTabVisibility()
+{
+  const bool showGeneral = (activeTab == SettingsTab::General);
+  const bool showAudio =
+      (!pluginMode && deviceManager != nullptr &&
+       activeTab == SettingsTab::Audio);
+  const bool showGpuDeviceList = shouldShowGpuDeviceList();
+
+  deviceLabel.setVisible(showGeneral);
+  deviceComboBox.setVisible(showGeneral);
+  gpuDeviceLabel.setVisible(showGeneral && showGpuDeviceList);
+  gpuDeviceComboBox.setVisible(showGeneral && showGpuDeviceList);
+  pitchDetectorLabel.setVisible(showGeneral);
+  pitchDetectorComboBox.setVisible(showGeneral);
+  gameChunksDebugLabel.setVisible(showGeneral);
+  segmentsDebugToggle.setVisible(showGeneral);
+  gameValuesDebugLabel.setVisible(showGeneral);
+  gameValuesDebugToggle.setVisible(showGeneral);
+  noteFramesDebugLabel.setVisible(showGeneral);
+  noteFramesDebugToggle.setVisible(showGeneral);
+  uvInterpolationDebugLabel.setVisible(showGeneral);
+  uvInterpolationDebugToggle.setVisible(showGeneral);
+  actualF0DebugLabel.setVisible(showGeneral);
+  actualF0DebugToggle.setVisible(showGeneral);
+  cleanedF0DebugLabel.setVisible(showGeneral);
+  cleanedF0DebugToggle.setVisible(showGeneral);
+  vocoderF0DebugLabel.setVisible(showGeneral);
+  vocoderF0DebugToggle.setVisible(showGeneral);
+  infoLabel.setVisible(showGeneral);
+
+  audioDeviceTypeLabel.setVisible(showAudio);
+  audioDeviceTypeComboBox.setVisible(showAudio);
+  audioOutputLabel.setVisible(showAudio);
+  audioOutputComboBox.setVisible(showAudio);
+  sampleRateLabel.setVisible(showAudio);
+  sampleRateComboBox.setVisible(showAudio);
+  bufferSizeLabel.setVisible(showAudio);
+  bufferSizeComboBox.setVisible(showAudio);
+  outputChannelsLabel.setVisible(showAudio);
+  outputChannelsComboBox.setVisible(showAudio);
+
+  generalTabButton.setVisible(kShowSettingsTabSelector);
+  audioTabButton.setVisible(kShowSettingsTabSelector &&
+                            !pluginMode && deviceManager != nullptr);
+
+  if (pluginMode || deviceManager == nullptr)
+    setActiveTab(SettingsTab::General);
+}
+
+void SettingsComponent::updateDeviceList()
+{
+  deviceComboBox.clear();
+
+  auto devices = getAvailableDevices();
+  int selectedIndex = 0;
+
+  // A DirectML runtime can be installed even when Windows exposes no usable
+  // hardware adapter. Do not retain a stale GPU choice in that case.
+  if (!devices.contains(currentDevice))
+  {
+    currentDevice = "CPU";
+    gpuDeviceId = 0;
+  }
+
+  const bool shouldUseDefaultDevice =
+      settingsManager == nullptr || !settingsManager->hasStoredDevice();
+
+  // Auto-select based on compile-time flags until the user saves a preference.
+  if (shouldUseDefaultDevice && currentDevice == "CPU")
+  {
+#if defined(_WIN32) && defined(USE_DIRECTML)
+    // On Windows, prefer DirectML when the runtime exposes the provider.
+    for (int i = 0; i < devices.size(); ++i)
+    {
+      if (devices[i] == "DirectML")
+      {
+        selectedIndex = i;
+        currentDevice = devices[i];
+        gpuDeviceId = GpuDeviceList::getDefaultDeviceIndex(currentDevice);
+        break;
+      }
+    }
+#elif defined(USE_CUDA)
+    // If CUDA is compiled in, default to CUDA
+    for (int i = 0; i < devices.size(); ++i)
+    {
+      if (devices[i] == "CUDA")
+      {
+        selectedIndex = i;
+        currentDevice = devices[i];
+        break;
+      }
+    }
+#else
+    // No GPU compiled in, stay on CPU
+#endif
+  }
+
+  for (int i = 0; i < devices.size(); ++i)
+  {
+    deviceComboBox.addItem(devices[i], i + 1);
+    if (devices[i] == currentDevice)
+      selectedIndex = i;
+  }
+
+  deviceComboBox.setSelectedItemIndex(selectedIndex,
+                                      juce::dontSendNotification);
+
+  // Update info for initially selected device
+  comboBoxChanged(&deviceComboBox);
+}
+
+void SettingsComponent::updateGPUDeviceList(const juce::String &deviceType)
+{
+  gpuDeviceComboBox.clear();
+
+  const auto deviceNames = GpuDeviceList::getDeviceNames(deviceType);
+  for (int i = 0; i < deviceNames.size(); ++i)
+    gpuDeviceComboBox.addItem(deviceNames[i], i + 1);
+
+  if (gpuDeviceComboBox.getNumItems() == 0)
+  {
+    if (deviceType == "CPU")
+      return;
+
+    // A provider that picks its own device still gets a row, so the control
+    // does not vanish and leave the user wondering what it is running on.
+    gpuDeviceComboBox.addItem(TR("settings.default_gpu"), 1);
+  }
+
+  const int defaultIndex = GpuDeviceList::getDefaultDeviceIndex(deviceType);
+  const bool hasStoredId =
+      settingsManager != nullptr && settingsManager->hasStoredGpuDeviceId();
+
+  // An id the user chose wins, as long as this provider still has that device.
+  // Anything else - never chosen, or carried over from a provider that
+  // enumerated more devices - falls back to the provider's own default.
+  int index = hasStoredId ? gpuDeviceId : defaultIndex;
+  if (!juce::isPositiveAndBelow(index, gpuDeviceComboBox.getNumItems()))
+    index = defaultIndex;
+  if (!juce::isPositiveAndBelow(index, gpuDeviceComboBox.getNumItems()))
+    index = 0;
+
+  gpuDeviceId = index;
+  gpuDeviceComboBox.setSelectedId(index + 1, juce::dontSendNotification);
+}
+
+juce::StringArray SettingsComponent::getAvailableDevices()
+{
+  juce::StringArray devices;
+
+  // CPU is always available
+  devices.add("CPU");
+
+#ifdef HAVE_ONNXRUNTIME
+  try
+  {
+    // Get providers that are compiled into the ONNX Runtime library
+    auto availableProviders = Ort::GetAvailableProviders();
+
+    // Check which providers are available
+    bool hasCuda = false, hasDml = false, hasCoreML = false,
+         hasTensorRT = false;
+
+    for (const auto &provider : availableProviders)
+    {
+      juce::String providerStr(provider);
+
+      if (providerStr == "CUDAExecutionProvider")
+        hasCuda = true;
+      else if (providerStr == "DmlExecutionProvider")
+        hasDml = true;
+      else if (providerStr == "CoreMLExecutionProvider")
+        hasCoreML = true;
+      else if (providerStr == "TensorrtExecutionProvider")
+        hasTensorRT = true;
+    }
+
+    // Add available GPU providers based on compile-time flags
+    // DML and CUDA are mutually exclusive
+#ifdef USE_DIRECTML
+    if (hasDml
+#ifdef _WIN32
+        && !GpuDeviceList::getDisplayAdapterNames().isEmpty()
+#endif
+    )
+    {
+      devices.add("DirectML");
+    }
+#elif defined(USE_CUDA)
+    if (hasCuda)
+    {
+      devices.add("CUDA");
+    }
+#else
+    // No GPU compiled in, but show available providers for information
+    if (hasCuda)
+    {
+      devices.add("CUDA");
+    }
+    if (hasDml)
+    {
+      devices.add("DirectML");
+    }
+#endif
+    if (hasCoreML)
+    {
+      devices.add("CoreML");
+    }
+    if (hasTensorRT)
+    {
+      devices.add("TensorRT");
+    }
+
+    // If no GPU providers found, show info about how to enable them
+    if (!hasCuda && !hasDml && !hasCoreML && !hasTensorRT)
+    {
+    }
+  }
+  catch (const std::exception &e)
+  {
+  }
+#else
+#endif
+
+  return devices;
+}
+
+void SettingsComponent::loadSettings()
+{
+  if (settingsManager)
+    settingsManager->loadConfig();
+
+  if (settingsManager)
+  {
+    currentDevice = settingsManager->getDevice();
+    gpuDeviceId = settingsManager->getGPUDeviceId();
+    pitchDetectorType = settingsManager->getPitchDetectorType();
+    followSystemAudioOutput = settingsManager->getFollowSystemAudioOutput();
+    preferredAudioOutputDevice = settingsManager->getPreferredAudioOutputDevice();
+    showSegmentsDebug = settingsManager->getShowSegmentsDebug();
+    showGameValuesDebug = settingsManager->getShowGameValuesDebug();
+    showNoteFramesDebug = settingsManager->getShowNoteFramesDebug();
+    showUvInterpolationDebug = settingsManager->getShowUvInterpolationDebug();
+    showActualF0Debug = settingsManager->getShowActualF0Debug();
+    showCleanedF0Debug = settingsManager->getShowCleanedF0Debug();
+    showVocoderF0Debug = settingsManager->getShowVocoderF0Debug();
+
+  }
+
+  // Update the ComboBox selection to match loaded settings
+  for (int i = 0; i < deviceComboBox.getNumItems(); ++i)
+  {
+    if (deviceComboBox.getItemText(i) == currentDevice)
+    {
+      deviceComboBox.setSelectedItemIndex(i, juce::dontSendNotification);
+      break;
+    }
+  }
+
+  // Update GPU device ID and visibility
+  bool showGpuDeviceList =
+      (currentDevice == "CUDA" || currentDevice == "DirectML");
+  if (showGpuDeviceList)
+  {
+    // Update GPU device list for the loaded device type
+    updateGPUDeviceList(currentDevice);
+  }
+  gpuDeviceComboBox.setSelectedId(gpuDeviceId + 1, juce::dontSendNotification);
+  gpuDeviceLabel.setVisible(showGpuDeviceList);
+  gpuDeviceComboBox.setVisible(showGpuDeviceList);
+
+  // Update pitch detector combo box
+  if (pitchDetectorType == PitchDetectorType::RMVPE)
+    pitchDetectorComboBox.setSelectedId(1, juce::dontSendNotification);
+  else if (pitchDetectorType == PitchDetectorType::FCPE)
+    pitchDetectorComboBox.setSelectedId(2, juce::dontSendNotification);
+
+  segmentsDebugToggle.setToggleState(showSegmentsDebug,
+                                     juce::dontSendNotification);
+  gameValuesDebugToggle.setToggleState(showGameValuesDebug,
+                                       juce::dontSendNotification);
+  noteFramesDebugToggle.setToggleState(showNoteFramesDebug,
+                                       juce::dontSendNotification);
+  uvInterpolationDebugToggle.setToggleState(showUvInterpolationDebug,
+                                            juce::dontSendNotification);
+  actualF0DebugToggle.setToggleState(showActualF0Debug,
+                                     juce::dontSendNotification);
+  cleanedF0DebugToggle.setToggleState(showCleanedF0Debug,
+                                      juce::dontSendNotification);
+  vocoderF0DebugToggle.setToggleState(showVocoderF0Debug,
+                                      juce::dontSendNotification);
+
+  hasLoadedSettings = true;
+  lastConfirmedDevice = currentDevice;
+  lastConfirmedGpuDeviceId = gpuDeviceId;
+
+  if (!pluginMode && deviceManager != nullptr)
+    updateAudioOutputDevices(true);
+}
+
+void SettingsComponent::saveSettings()
+{
+  // Nothing is worth writing before the stored values have been read back.
+  if (!hasLoadedSettings)
+    return;
+
+  // The language itself is chosen in the parameter panel; this dialog only
+  // writes back whatever is currently in effect, so saving here never
+  // overwrites that choice.
+  const juce::String langCode =
+      Localization::getInstance().getPersistedLanguageCode();
+
+  if (settingsManager)
+  {
+    settingsManager->setDevice(currentDevice);
+    settingsManager->setGPUDeviceId(gpuDeviceId);
+    settingsManager->setPitchDetectorType(pitchDetectorType);
+    settingsManager->setLanguage(langCode);
+    settingsManager->setShowSegmentsDebug(showSegmentsDebug);
+    settingsManager->setShowGameValuesDebug(showGameValuesDebug);
+    settingsManager->setShowNoteFramesDebug(showNoteFramesDebug);
+    settingsManager->setShowUvInterpolationDebug(showUvInterpolationDebug);
+    settingsManager->setShowActualF0Debug(showActualF0Debug);
+    settingsManager->setShowCleanedF0Debug(showCleanedF0Debug);
+    settingsManager->setShowVocoderF0Debug(showVocoderF0Debug);
+    settingsManager->setFollowSystemAudioOutput(followSystemAudioOutput);
+    settingsManager->setPreferredAudioOutputDevice(preferredAudioOutputDevice);
+    settingsManager->saveConfig();
+  }
+}
+
+void SettingsComponent::updateAudioDeviceTypes()
+{
+  if (deviceManager == nullptr)
+    return;
+
+  const juce::ScopedValueSetter<bool> refreshingAudioUi(
+      isRefreshingAudioControls, true);
+
+  audioDeviceTypeComboBox.clear(juce::dontSendNotification);
+  audioDeviceTypeOrder.clear();
+
+  auto &types = deviceManager->getAvailableDeviceTypes();
+  juce::AudioIODeviceType *asioType = nullptr;
+  for (int i = 0; i < types.size(); ++i)
+  {
+    if (types[i]->getTypeName() == "ASIO")
+    {
+      asioType = types[i];
+    }
+    else
+    {
+      audioDeviceTypeOrder.add(types[i]);
+    }
+  }
+
+  if (asioType != nullptr)
+    audioDeviceTypeOrder.insert(0, asioType);
+
+  for (int i = 0; i < audioDeviceTypeOrder.size(); ++i)
+    audioDeviceTypeComboBox.addItem(
+        audioDeviceTypeOrder[i]->getTypeName(), i + 1);
+
+  if (auto *currentType = deviceManager->getCurrentDeviceTypeObject())
+  {
+    for (int i = 0; i < audioDeviceTypeOrder.size(); ++i)
+    {
+      if (audioDeviceTypeOrder[i] == currentType)
+      {
+        audioDeviceTypeComboBox.setSelectedId(i + 1,
+                                              juce::dontSendNotification);
+        break;
+      }
+    }
+  }
+  updateAudioOutputDevices(true);
+}
+
+void SettingsComponent::updateAudioOutputDevices(bool force)
+{
+  juce::ignoreUnused(force);
+  if (deviceManager == nullptr)
+    return;
+
+  const juce::ScopedValueSetter<bool> refreshingAudioUi(
+      isRefreshingAudioControls, true);
+
+  auto *currentType = deviceManager->getCurrentDeviceTypeObject();
+  if (currentType != nullptr)
+  {
+    auto devices = currentType->getDeviceNames(false); // false = output devices
+
+    juce::String currentName;
+    if (auto *audioDevice = deviceManager->getCurrentAudioDevice())
+      currentName = audioDevice->getName();
+
+    audioOutputComboBox.clear(juce::dontSendNotification);
+    audioOutputComboBox.addItem(TR("settings.system_default"),
+                                kFollowSystemOutputId);
+    for (int i = 0; i < devices.size(); ++i)
+      audioOutputComboBox.addItem(devices[i], i + 2);
+
+    int targetId = kFollowSystemOutputId;
+    if (!followSystemAudioOutput)
+    {
+      int preferredIdx = devices.indexOf(preferredAudioOutputDevice);
+      if (preferredIdx >= 0)
+      {
+        targetId = preferredIdx + 2;
+      }
+      else
+      {
+        int currentIdx = devices.indexOf(currentName);
+        if (currentIdx >= 0)
+        {
+          targetId = currentIdx + 2;
+          preferredAudioOutputDevice = currentName;
+        }
+        else if (devices.size() > 0)
+        {
+          targetId = 2;
+          preferredAudioOutputDevice = devices[0];
+        }
+        else
+        {
+          followSystemAudioOutput = true;
+          targetId = kFollowSystemOutputId;
+        }
+      }
+    }
+
+    audioOutputComboBox.setSelectedId(targetId, juce::dontSendNotification);
+    sampleRateComboBox.setEnabled(!followSystemAudioOutput);
+    bufferSizeComboBox.setEnabled(!followSystemAudioOutput);
+    outputChannelsComboBox.setEnabled(!followSystemAudioOutput);
+
+    auto setup = deviceManager->getAudioDeviceSetup();
+    int currentOutputChannels = 2;
+    if (setup.useDefaultOutputChannels)
+    {
+      if (auto *audioDevice = deviceManager->getCurrentAudioDevice())
+        currentOutputChannels =
+            juce::jlimit(1, 2,
+                         audioDevice->getActiveOutputChannels().countNumberOfSetBits());
+    }
+    else
+    {
+      currentOutputChannels =
+          juce::jlimit(1, 2, setup.outputChannels.countNumberOfSetBits());
+    }
+    outputChannelsComboBox.setSelectedId(currentOutputChannels,
+                                         juce::dontSendNotification);
+  }
+
+  updateSampleRates();
+  updateBufferSizes();
+}
+
+void SettingsComponent::updateSampleRates()
+{
+  if (deviceManager == nullptr)
+    return;
+
+  const juce::ScopedValueSetter<bool> refreshingAudioUi(
+      isRefreshingAudioControls, true);
+
+  sampleRateComboBox.clear(juce::dontSendNotification);
+  if (auto *device = deviceManager->getCurrentAudioDevice())
+  {
+    auto rates = device->getAvailableSampleRates();
+    double currentRate = device->getCurrentSampleRate();
+    for (int i = 0; i < rates.size(); ++i)
+    {
+      sampleRateComboBox.addItem(
+          juce::String(static_cast<int>(rates[i])) + " Hz", i + 1);
+      if (std::abs(rates[i] - currentRate) < 1.0)
+        sampleRateComboBox.setSelectedId(i + 1, juce::dontSendNotification);
+    }
+  }
+  else
+  {
+    auto setup = deviceManager->getAudioDeviceSetup();
+    if (setup.sampleRate > 0.0)
+    {
+      sampleRateComboBox.addItem(
+          juce::String(static_cast<int>(setup.sampleRate)) + " Hz", 1);
+      sampleRateComboBox.setSelectedId(1, juce::dontSendNotification);
+    }
+  }
+}
+
+void SettingsComponent::updateBufferSizes()
+{
+  if (deviceManager == nullptr)
+    return;
+
+  const juce::ScopedValueSetter<bool> refreshingAudioUi(
+      isRefreshingAudioControls, true);
+
+  bufferSizeComboBox.clear(juce::dontSendNotification);
+  if (auto *device = deviceManager->getCurrentAudioDevice())
+  {
+    auto sizes = device->getAvailableBufferSizes();
+    int currentSize = device->getCurrentBufferSizeSamples();
+    for (int i = 0; i < sizes.size(); ++i)
+    {
+      bufferSizeComboBox.addItem(juce::String(sizes[i]) + " samples", i + 1);
+      if (sizes[i] == currentSize)
+        bufferSizeComboBox.setSelectedId(i + 1, juce::dontSendNotification);
+    }
+  }
+  else
+  {
+    auto setup = deviceManager->getAudioDeviceSetup();
+    if (setup.bufferSize > 0)
+    {
+      bufferSizeComboBox.addItem(juce::String(setup.bufferSize) + " samples", 1);
+      bufferSizeComboBox.setSelectedId(1, juce::dontSendNotification);
+    }
+  }
+}
+
+void SettingsComponent::applyAudioSettings()
+{
+  if (deviceManager == nullptr)
+    return;
+
+  auto setup = deviceManager->getAudioDeviceSetup();
+  const auto originalSetup = setup;
+  followSystemAudioOutput =
+      (audioOutputComboBox.getSelectedId() == kFollowSystemOutputId);
+
+  juce::String targetOutputName;
+  if (followSystemAudioOutput)
+  {
+    targetOutputName = resolveDefaultOutputDeviceName(deviceManager);
+
+    if (targetOutputName.isEmpty())
+    {
+      if (auto *audioDevice = deviceManager->getCurrentAudioDevice())
+        targetOutputName = audioDevice->getName();
+    }
+  }
+  else
+  {
+    if (audioOutputComboBox.getSelectedId() > kFollowSystemOutputId)
+      targetOutputName = audioOutputComboBox.getText();
+    else
+      targetOutputName = preferredAudioOutputDevice;
+
+    if (targetOutputName.isNotEmpty())
+      preferredAudioOutputDevice = targetOutputName;
+  }
+
+  if (targetOutputName.isEmpty())
+  {
+    auto initError = deviceManager->initialiseWithDefaultDevices(0, 2);
+    if (initError.isNotEmpty())
+    {
+      return;
+    }
+
+    followSystemAudioOutput = true;
+    updateAudioOutputDevices(true);
+    return;
+  }
+
+  const bool outputDeviceChanged = (setup.outputDeviceName != targetOutputName);
+  setup.outputDeviceName = targetOutputName;
+  const bool useDefaultOutputChannels = followSystemAudioOutput || outputDeviceChanged;
+
+  // When following system default or switching output device, let JUCE pick a
+  // valid sample-rate/buffer pair for the destination device.
+  if (followSystemAudioOutput || outputDeviceChanged)
+  {
+    setup.sampleRate = 0.0;
+    setup.bufferSize = 0;
+  }
+  else if (auto *device = deviceManager->getCurrentAudioDevice())
+  {
+    auto rates = device->getAvailableSampleRates();
+    int rateIdx = sampleRateComboBox.getSelectedId() - 1;
+    if (rateIdx >= 0 && rateIdx < rates.size())
+      setup.sampleRate = rates[rateIdx];
+
+    auto sizes = device->getAvailableBufferSizes();
+    int sizeIdx = bufferSizeComboBox.getSelectedId() - 1;
+    if (sizeIdx >= 0 && sizeIdx < sizes.size())
+      setup.bufferSize = sizes[sizeIdx];
+  }
+
+  if (useDefaultOutputChannels)
+  {
+    setup.useDefaultOutputChannels = true;
+    setup.outputChannels.clear();
+  }
+  else
+  {
+    setup.useDefaultOutputChannels = false;
+    const int channels = juce::jlimit(1, 2, outputChannelsComboBox.getSelectedId());
+    setup.outputChannels.setRange(0, channels, true);
+  }
+
+  if (setup == originalSetup)
+  {
+    // The device itself is unchanged, but "System Default" vs. a pinned device
+    // may have flipped, so the selection still needs storing.
+    persistAudioDeviceSettings();
+    return;
+  }
+
+  auto error = deviceManager->setAudioDeviceSetup(setup, true);
+  if (error.isNotEmpty() && (setup.sampleRate != 0.0 || setup.bufferSize != 0))
+  {
+    auto fallback = setup;
+    fallback.sampleRate = 0.0;
+    fallback.bufferSize = 0;
+    fallback.useDefaultOutputChannels = true;
+    fallback.outputChannels.clear();
+    error = deviceManager->setAudioDeviceSetup(fallback, true);
+  }
+
+  if (error.isNotEmpty())
+  {
+    updateAudioOutputDevices(true);
+    return;
+  }
+
+  persistAudioDeviceSettings();
+
+  updateAudioOutputDevices(true);
+}
+
+void SettingsComponent::persistAudioDeviceSettings()
+{
+  // Before loadSettings() the members still hold defaults, which would clobber
+  // the stored selection.
+  if (settingsManager == nullptr || pluginMode || deviceManager == nullptr ||
+      !hasLoadedSettings)
+    return;
+
+  settingsManager->setFollowSystemAudioOutput(followSystemAudioOutput);
+  settingsManager->setPreferredAudioOutputDevice(preferredAudioOutputDevice);
+
+  // Store the selection even when the device failed to open: picking JACK
+  // with no server running is still a deliberate choice, and it should be
+  // honoured on the next launch (when a server may well be up). Recovering
+  // from a driver that cannot open is initializeAudio()'s job, and it leaves
+  // the stored preference alone.
+  if (auto state = deviceManager->createStateXml())
+    settingsManager->setAudioDeviceState(state->toString());
+
+  settingsManager->saveConfig();
+}
+
+void SettingsComponent::syncToSystemOutputIfNeeded()
+{
+  if (!followSystemAudioOutput || deviceManager == nullptr)
+    return;
+
+  const auto targetOutputName = resolveDefaultOutputDeviceName(deviceManager);
+  if (targetOutputName.isEmpty())
+    return;
+
+  juce::String currentName;
+  if (auto *audioDevice = deviceManager->getCurrentAudioDevice())
+    currentName = audioDevice->getName();
+  if (currentName == targetOutputName)
+    return;
+
+  auto setup = deviceManager->getAudioDeviceSetup();
+  setup.outputDeviceName = targetOutputName;
+  setup.sampleRate = 0.0;
+  setup.bufferSize = 0;
+  setup.useDefaultOutputChannels = true;
+  setup.outputChannels.clear();
+
+  auto error = deviceManager->setAudioDeviceSetup(setup, true);
+  if (error.isNotEmpty())
+  {
+    auto initError = deviceManager->initialiseWithDefaultDevices(0, 2);
+    juce::ignoreUnused(initError);
+  }
+}
+
+void SettingsComponent::refreshLocalisedText()
+{
+  titleLabel.setText(TR("settings.title"), juce::dontSendNotification);
+  generalTabButton.setButtonText(TR("settings.general"));
+  audioTabButton.setButtonText(TR("settings.audio"));
+
+  deviceLabel.setText(TR("settings.device"), juce::dontSendNotification);
+  gpuDeviceLabel.setText(TR("settings.gpu_device"), juce::dontSendNotification);
+  pitchDetectorLabel.setText(TR("settings.pitch_detector"),
+                             juce::dontSendNotification);
+
+  gameChunksDebugLabel.setText(TR("settings.debug_game_chunks"),
+                               juce::dontSendNotification);
+  gameValuesDebugLabel.setText(TR("settings.debug_game_values"),
+                               juce::dontSendNotification);
+  noteFramesDebugLabel.setText(TR("settings.debug_note_frames"),
+                               juce::dontSendNotification);
+  uvInterpolationDebugLabel.setText(TR("settings.debug_uv_f0"),
+                                    juce::dontSendNotification);
+  actualF0DebugLabel.setText(TR("settings.debug_raw_f0"),
+                             juce::dontSendNotification);
+  cleanedF0DebugLabel.setText(TR("settings.debug_cleaned_f0"),
+                              juce::dontSendNotification);
+  vocoderF0DebugLabel.setText(TR("settings.debug_vocoder_f0"),
+                              juce::dontSendNotification);
+
+  if (currentDevice == "CPU")
+    infoLabel.setText(TR("settings.cpu_desc"), juce::dontSendNotification);
+  else if (currentDevice == "CUDA")
+    infoLabel.setText(TR("settings.cuda_desc"), juce::dontSendNotification);
+  else if (currentDevice == "DirectML")
+    infoLabel.setText(TR("settings.directml_desc"), juce::dontSendNotification);
+  else if (currentDevice == "CoreML")
+    infoLabel.setText(TR("settings.coreml_desc"), juce::dontSendNotification);
+
+  if (!pluginMode && deviceManager != nullptr)
+  {
+    audioDeviceTypeLabel.setText(TR("settings.audio_driver"),
+                                 juce::dontSendNotification);
+    audioOutputLabel.setText(TR("settings.audio_output"),
+                             juce::dontSendNotification);
+    sampleRateLabel.setText(TR("settings.sample_rate"),
+                            juce::dontSendNotification);
+    bufferSizeLabel.setText(TR("settings.buffer_size"),
+                            juce::dontSendNotification);
+    outputChannelsLabel.setText(TR("settings.output_channels"),
+                                juce::dontSendNotification);
+
+    const int selectedChannels = outputChannelsComboBox.getSelectedId();
+    outputChannelsComboBox.clear(juce::dontSendNotification);
+    outputChannelsComboBox.addItem(TR("settings.mono"), 1);
+    outputChannelsComboBox.addItem(TR("settings.stereo"), 2);
+    outputChannelsComboBox.setSelectedId(selectedChannels > 0 ? selectedChannels
+                                                              : 2,
+                                         juce::dontSendNotification);
+
+    updateAudioOutputDevices(true);
+  }
+
+  resized();
+  repaint();
+}
+
+// SettingsOverlay and SettingsDialog implementations are in SettingsOverlay.cpp
