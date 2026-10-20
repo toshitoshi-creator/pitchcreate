@@ -31,7 +31,7 @@ jobs:
 
       - name: Check bundle contents
         run: |
-          APP=$(find build-ios -name "PitchNet.app" -type d -path "*Release-iphoneos*" | head -1)
+          APP=$(find build-ios -name "PitchNet.app" -type d -not -path "*/CMakeFiles/*" | head -1)
           echo "App: $APP"
           ls -la "$APP" "$APP/Resources" "$APP/Resources/models" "$APP/Resources/models/GAME"
           test -f "$APP/Resources/models/fcpe.onnx"

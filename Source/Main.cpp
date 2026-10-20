@@ -235,9 +235,7 @@ public:
       setFullScreen(true);
       addToDesktop();
       setVisible(true);
-      return;
-#endif
-
+#else
       setResizable(true, true);
 
       // Ensure window is still opaque before adding to desktop
@@ -270,6 +268,7 @@ public:
           juce::String(getHeight()));
       setVisible(true);
       LOG("MainWindow: setVisible(true) done");
+#endif
 
 #if JUCE_WINDOWS
       if (auto *peer = getPeer()) {
